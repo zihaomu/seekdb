@@ -38,6 +38,8 @@ namespace oceanbase
 namespace share
 {
 
+static int64_t g_vector_index_adapter_generation = 0;
+
 ObVectorIndexInfo::ObVectorIndexInfo()
   : rowkey_vid_table_id_(common::OB_INVALID_ID),
     vid_rowkey_table_id_(common::OB_INVALID_ID),
@@ -461,10 +463,12 @@ ObPluginVectorIndexAdaptor::ObPluginVectorIndexAdaptor(common::ObIAllocator *all
     snapshot_table_id_(OB_INVALID_ID), data_table_id_(OB_INVALID_ID),
     embedded_table_id_(OB_INVALID_ID),
     rowkey_vid_table_id_(OB_INVALID_ID), vid_rowkey_table_id_(OB_INVALID_ID),
+    generation_(static_cast<uint64_t>(ATOMIC_AAF(&g_vector_index_adapter_generation, 1))),
     ref_cnt_(0), idle_cnt_(0), mem_check_cnt_(0), is_mem_limited_(false), all_vsag_use_mem_(nullptr), allocator_(allocator),
     parent_mem_ctx_(entity), index_identity_(), follower_sync_statistics_(), is_in_opt_task_(false), need_be_optimized_(false), extra_info_column_count_(0),
     query_lock_(), reload_finish_(false), sparse_vector_type_(nullptr), is_need_vid_(true), last_embedding_time_(ObTimeUtility::fast_current_time())
 {
+  LOG_INFO("create vector index adapter generation", KP(this), K(generation_));
 }
 
 ObPluginVectorIndexAdaptor::~ObPluginVectorIndexAdaptor()

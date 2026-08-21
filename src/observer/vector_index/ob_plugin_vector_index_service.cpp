@@ -558,7 +558,13 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObVectorIndexAcquireCtx &c
                                                          vec_index_param, dim))) {
   } else {
     share::ObPluginVectorIndexAdaptor* adaptor = adapter_guard.get_adatper();
-    if (OB_NOT_NULL(adaptor) && !adaptor->validate_tablet_ids(ctx)) {
+    if (OB_ISNULL(adaptor)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("acquired null vector index adapter", K(ret), K(ctx));
+    } else if (!adapter_guard.generation_matches()) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("vector index adapter generation changed", K(ret), K(ctx), K(adapter_guard));
+    } else if (!adaptor->validate_tablet_ids(ctx)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("validate tablet ids failed", K(ret), K(ctx), K(adaptor));
     }

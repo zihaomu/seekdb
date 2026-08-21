@@ -601,6 +601,7 @@ public:
   uint64_t get_embedded_table_id() { return embedded_table_id_; }
   uint64_t get_rowkey_vid_table_id() { return rowkey_vid_table_id_; }
   uint64_t get_vid_rowkey_table_id() { return vid_rowkey_table_id_; }
+  uint64_t get_generation() const { return generation_; }
   void close_snap_data_rb_flag() {
     if (is_mem_data_init_atomic(VIRT_SNAP)) {
       snap_data_->rb_flag_ = false;
@@ -855,6 +856,7 @@ public:
               K_(inc_tablet_id), K_(vbitmap_tablet_id), K_(snapshot_tablet_id), K_(embedded_tablet_id),
               K_(data_table_id), K_(rowkey_vid_table_id), K_(vid_rowkey_table_id),
               K_(inc_table_id),  K_(vbitmap_table_id), K_(snapshot_table_id), K_(embedded_table_id),
+              K_(generation),
               K_(ref_cnt), K_(idle_cnt), KP_(allocator),
               K_(index_identity), K_(follower_sync_statistics),
               K_(mem_check_cnt), K_(is_mem_limited), K_(is_need_vid));
@@ -927,6 +929,7 @@ private:
   uint64_t rowkey_vid_table_id_;
   uint64_t vid_rowkey_table_id_;
 
+  uint64_t generation_;
   int64_t ref_cnt_;
   int64_t idle_cnt_; // not merged cnt
   int64_t mem_check_cnt_;
@@ -963,8 +966,8 @@ private:
 class ObPluginVectorIndexAdapterGuard
 {
 public:
-  ObPluginVectorIndexAdapterGuard(ObPluginVectorIndexAdaptor *adapter = nullptr)
-    : adapter_(adapter)
+  ObPluginVectorIndexAdapterGuard()
+    : adapter_(nullptr), generation_(0)
   {}
   ~ObPluginVectorIndexAdapterGuard()
   {
@@ -981,27 +984,38 @@ public:
         }
       }
       adapter_ = nullptr;
+      generation_ = 0;
     }
   }
 
   bool is_valid() { return adapter_ != nullptr; }
   ObPluginVectorIndexAdaptor* get_adatper() { return adapter_; }
+  uint64_t get_generation() const { return generation_; }
+  bool generation_matches() const
+  {
+    return OB_NOT_NULL(adapter_) && generation_ == adapter_->get_generation();
+  }
   int set_adapter(ObPluginVectorIndexAdaptor *adapter)
   {
     int ret = OB_SUCCESS;
     if (is_valid()) {
       ret = OB_ERR_UNEXPECTED;
       OB_LOG(WARN, "vector index adapter guard can only set once", KPC(adapter_), KPC(adapter));
+    } else if (OB_ISNULL(adapter)) {
+      ret = OB_INVALID_ARGUMENT;
+      OB_LOG(WARN, "cannot guard null vector index adapter", K(ret));
     } else {
       adapter_ = adapter;
+      generation_ = adapter_->get_generation();
       (void)adapter_->inc_ref();
     }
     return ret;
   }
-  TO_STRING_KV(KPC_(adapter));
+  TO_STRING_KV(KPC_(adapter), K_(generation));
 
 private:
   ObPluginVectorIndexAdaptor *adapter_;
+  uint64_t generation_;
 };
 
 void free_hnswsq_array_data(ObVectorIndexMemData *&memdata, ObIAllocator *allocator);
