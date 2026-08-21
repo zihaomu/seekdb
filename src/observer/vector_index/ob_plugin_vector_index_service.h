@@ -104,6 +104,9 @@ private:
 
 typedef common::hash::ObHashMap<ObIvfHelperKey, ObIvfBuildHelper*> IvfVectorIndexHelperMap;
 typedef common::hash::ObHashMap<common::ObTabletID, ObIvfCacheMgr*> IvfCacheMgrMap;
+typedef common::hash::ObHashMap<ObVectorIndexSchemaIdentity,
+                                ObVectorIndexSchemaBinding,
+                                common::hash::NoPthreadDefendMode> VectorIndexSchemaBindingMap;
 // Manage all vector index adapter in a ls
 class ObPluginVectorIndexMgr
 {
@@ -113,6 +116,7 @@ public:
       need_check_(false),
       complete_index_adpt_map_(),
       partial_index_adpt_map_(),
+      schema_binding_map_(),
       ivf_index_helper_map_(),
       adapter_map_rwlock_(),
       task_ctx_(),
@@ -186,6 +190,10 @@ public:
                             ObPluginVectorIndexAdapterGuard &adapter_guard,
                             ObString *vec_index_param,
                             int64_t dim);
+  int publish_schema_binding(ObPluginVectorIndexAdaptor &adapter);
+  int get_adapter_guard_by_schema(const ObVectorIndexSchemaIdentity &identity,
+                                  ObPluginVectorIndexAdapterGuard &adapter_guard,
+                                  ObVectorIndexSchemaBinding *binding = nullptr);
   int check_and_merge_partial_inner(ObVecIdxSharedTableInfoMap &info_map, ObIAllocator &allocator);
 
   // maintance interface
@@ -233,6 +241,9 @@ private:
                                      ObIAllocator &allocator);
 
   int get_build_helper_inst_(const ObIvfHelperKey &key, ObIvfBuildHelper *&helper_inst);
+  int build_schema_binding_(ObPluginVectorIndexAdaptor &adapter,
+                            ObVectorIndexSchemaIdentity &identity,
+                            ObVectorIndexSchemaBinding &binding);
   int create_ivf_cache_mgr(ObIAllocator &allocator,
                           const ObIvfCacheMgrKey &key,
                           const ObVectorIndexParam &vec_index_param,
@@ -250,6 +261,7 @@ private:
   bool need_check_; // schema version changed or storage is unavailable
   VectorIndexAdaptorMap complete_index_adpt_map_; // map of complete index adapters with full info
   VectorIndexAdaptorMap partial_index_adpt_map_; // map of passive created index adapters
+  VectorIndexSchemaBindingMap schema_binding_map_; // non-owning schema alias to tablet tuple + generation
   IvfVectorIndexHelperMap ivf_index_helper_map_; // map of ivf inder build helper
   IvfCacheMgrMap ivf_cache_mgr_map_; // map of ivf cache managers
   TCRWLock adapter_map_rwlock_; // lock for adapter maps
@@ -390,6 +402,9 @@ public:
                             ObPluginVectorIndexAdapterGuard &adapter_guard,
                             ObString *vec_index_param = nullptr,
                             int64_t dim = 0);
+  int acquire_adapter_guard(const ObVectorIndexSchemaIdentity &identity,
+                            ObPluginVectorIndexAdapterGuard &adapter_guard,
+                            ObVectorIndexSchemaBinding *binding = nullptr) override;
   int acquire_ivf_build_helper_guard(const ObIvfHelperKey &key,
                                      ObIndexType type,
                                      ObIvfBuildHelperGuard &helper_guard,

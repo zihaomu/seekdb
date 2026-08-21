@@ -64,6 +64,7 @@ class ObIVectorIndexService;
 namespace share
 {
 struct ObVectorNormalizeInfo;
+struct ObVectorIndexSchemaIdentity;
 
 enum VecColType {
   IVF_CENTER_ID_COL = 0,
@@ -587,6 +588,12 @@ public:
       const schema::ObTableSchema &data_table_schema,
       const schema::ObTableSchema &index_table_schema,
       ObIArray<uint64_t> &col_ids);
+
+  static int resolve_hnsw_schema_identity(
+      schema::ObSchemaGetterGuard &schema_guard,
+      const schema::ObTableSchema &data_table_schema,
+      uint64_t vector_column_id,
+      ObVectorIndexSchemaIdentity &identity);
 
   static int get_extra_info_column_id(
       const schema::ObTableSchema &data_table_schema,

@@ -38,6 +38,11 @@ public:
       ObString *vec_index_param = nullptr,
       int64_t dim = 0) = 0;
 
+  virtual int acquire_adapter_guard(
+      const share::ObVectorIndexSchemaIdentity &identity,
+      share::ObPluginVectorIndexAdapterGuard &adapter_guard,
+      share::ObVectorIndexSchemaBinding *binding = nullptr) = 0;
+
   virtual int acquire_ivf_cache_mgr_guard(
       const share::ObIvfCacheMgrKey &key,
       const share::ObVectorIndexParam &vec_index_param,

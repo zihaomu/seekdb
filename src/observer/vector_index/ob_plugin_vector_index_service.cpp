@@ -52,6 +52,7 @@ void ObPluginVectorIndexMgr::destroy()
     release_all_adapters();
     partial_index_adpt_map_.destroy();
     complete_index_adpt_map_.destroy();
+    schema_binding_map_.destroy();
     ivf_index_helper_map_.destroy();
     ivf_cache_mgr_map_.destroy();
     mem_sync_info_.destroy();
@@ -104,6 +105,7 @@ int ObPluginVectorIndexMgr::init(lib::MemoryContext &memory_context,
   int64_t hash_capacity = common::hash::cal_next_prime(DEFAULT_ADAPTER_HASH_SIZE);
   if (OB_FAIL(complete_index_adpt_map_.create(hash_capacity, "VecIdxAdptMap", "VecIdxAdptMap"))) {
   } else if (OB_FAIL(partial_index_adpt_map_.create(hash_capacity, "VecIdxAdptMap", "VecIdxAdptMap"))) {
+  } else if (OB_FAIL(schema_binding_map_.create(hash_capacity, "VecIdxSchMap", "VecIdxSchMap"))) {
   } else if (OB_FAIL(ivf_index_helper_map_.create(hash_capacity, "IvfIdxHpMap", "IvfIdxHpMap"))) {
   } else if (OB_FAIL(ivf_cache_mgr_map_.create(hash_capacity, "IvfMgrMap", "IvfMgrMap"))) {
   } else if (OB_FAIL(mem_sync_info_.init(hash_capacity))) {
@@ -537,6 +539,149 @@ int ObPluginVectorIndexMgr::get_and_merge_adapter(ObVectorIndexAcquireCtx &ctx,
   return ret;
 }
 
+int ObPluginVectorIndexMgr::build_schema_binding_(
+    ObPluginVectorIndexAdaptor &adapter,
+    ObVectorIndexSchemaIdentity &identity,
+    ObVectorIndexSchemaBinding &binding)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *data_schema = nullptr;
+  const ObTableSchema *inc_schema = nullptr;
+  ObSEArray<uint64_t, 2> vector_column_ids;
+  if (OB_UNLIKELY(adapter.get_data_table_id() == OB_INVALID_ID
+                  || adapter.get_inc_table_id() == OB_INVALID_ID)) {
+    ret = OB_ENTRY_NOT_EXIST;
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(adapter.get_data_table_id(), data_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(adapter.get_inc_table_id(), inc_schema))) {
+  } else if (OB_ISNULL(data_schema) || OB_ISNULL(inc_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_id(
+                 *data_schema, *inc_schema, vector_column_ids))) {
+  } else if (OB_UNLIKELY(vector_column_ids.count() != 1)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("vector index adapter does not map to one vector column",
+             K(ret), K(vector_column_ids), KPC(data_schema), KPC(inc_schema));
+  } else if (OB_FAIL(ObVectorIndexUtil::resolve_hnsw_schema_identity(
+                 schema_guard, *data_schema, vector_column_ids.at(0), identity))) {
+  } else if (OB_UNLIKELY(identity.data_table_id_ != adapter.get_data_table_id()
+                         || identity.rowkey_vid_table_id_ != adapter.get_rowkey_vid_table_id()
+                         || identity.vid_rowkey_table_id_ != adapter.get_vid_rowkey_table_id()
+                         || identity.inc_table_id_ != adapter.get_inc_table_id()
+                         || identity.vbitmap_table_id_ != adapter.get_vbitmap_table_id()
+                         || identity.snapshot_table_id_ != adapter.get_snapshot_table_id())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_INFO("vector index adapter does not match current schema identity",
+             K(ret), K(identity), KPC(&adapter));
+  } else {
+    binding.acquire_ctx_.inc_tablet_id_ = adapter.get_inc_tablet_id();
+    binding.acquire_ctx_.vbitmap_tablet_id_ = adapter.get_vbitmap_tablet_id();
+    binding.acquire_ctx_.snapshot_tablet_id_ = adapter.get_snap_tablet_id();
+    binding.acquire_ctx_.data_tablet_id_ = adapter.get_data_tablet_id();
+    binding.acquire_ctx_.embedded_tablet_id_ = adapter.get_embedded_tablet_id();
+    binding.generation_ = adapter.get_generation();
+    if (OB_UNLIKELY(!binding.is_valid())) {
+      ret = OB_ENTRY_NOT_EXIST;
+      LOG_INFO("complete vector index binding is not available", K(ret), K(identity), K(binding));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::publish_schema_binding(ObPluginVectorIndexAdaptor &adapter)
+{
+  int ret = OB_SUCCESS;
+  ObVectorIndexSchemaIdentity identity;
+  ObVectorIndexSchemaBinding binding;
+  const bool publish_owner = adapter.try_begin_schema_binding_publish();
+  if (!publish_owner) {
+  } else if (OB_FAIL(build_schema_binding_(adapter, identity, binding))) {
+  } else if (OB_UNLIKELY(!identity.is_valid() || !binding.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector index schema binding", K(ret), K(identity), K(binding));
+  } else {
+    WLockGuard lock_guard(adapter_map_rwlock_);
+    ObPluginVectorIndexAdaptor *current_adapter = nullptr;
+    if (OB_FAIL(get_adapter_inst_(binding.acquire_ctx_.inc_tablet_id_, current_adapter))) {
+      if (OB_HASH_NOT_EXIST != ret) {
+        LOG_WARN("failed to get current vector index adapter", K(ret), K(identity), K(binding));
+      }
+    } else if (OB_ISNULL(current_adapter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("current vector index adapter is null", K(ret), K(identity), K(binding));
+    } else if (current_adapter != &adapter
+               || current_adapter->get_generation() != binding.generation_
+               || !current_adapter->validate_tablet_ids(binding.acquire_ctx_)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_INFO("skip stale vector index schema binding publication",
+               K(ret), K(identity), K(binding), KPC(current_adapter), KPC(&adapter));
+    } else if (OB_FAIL(schema_binding_map_.set_refactored(identity, binding, 1 /* overwrite */))) {
+      LOG_WARN("failed to publish vector index schema binding", K(ret), K(identity), K(binding));
+    }
+  }
+  if (publish_owner) {
+    adapter.finish_schema_binding_publish(OB_SUCCESS == ret);
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::get_adapter_guard_by_schema(
+    const ObVectorIndexSchemaIdentity &identity,
+    ObPluginVectorIndexAdapterGuard &adapter_guard,
+    ObVectorIndexSchemaBinding *binding)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *data_schema = nullptr;
+  ObVectorIndexSchemaIdentity current_identity;
+  ObVectorIndexSchemaBinding current_binding;
+  if (OB_UNLIKELY(!identity.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector index schema identity", K(ret), K(identity));
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(identity.data_table_id_, data_schema))) {
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_INFO("bound vector index data schema no longer exists", K(ret), K(identity));
+  } else if (OB_FAIL(ObVectorIndexUtil::resolve_hnsw_schema_identity(
+                 schema_guard, *data_schema, identity.vector_column_id_, current_identity))) {
+  } else if (OB_UNLIKELY(!(current_identity == identity))) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_INFO("stale vector index schema identity", K(ret), K(identity), K(current_identity));
+  } else {
+    RLockGuard lock_guard(adapter_map_rwlock_);
+    ObPluginVectorIndexAdaptor *adapter = nullptr;
+    if (OB_FAIL(schema_binding_map_.get_refactored(identity, current_binding))) {
+      if (OB_HASH_NOT_EXIST != ret) {
+        LOG_WARN("failed to get vector index schema binding", K(ret), K(identity));
+      }
+    } else if (OB_UNLIKELY(!current_binding.is_valid())) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("invalid stored vector index schema binding", K(ret), K(identity), K(current_binding));
+    } else if (OB_FAIL(get_adapter_inst_(current_binding.acquire_ctx_.inc_tablet_id_, adapter))) {
+      if (OB_HASH_NOT_EXIST != ret) {
+        LOG_WARN("failed to get bound vector index adapter", K(ret), K(identity), K(current_binding));
+      }
+    } else if (OB_ISNULL(adapter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("bound vector index adapter is null", K(ret), K(identity), K(current_binding));
+    } else if (adapter->get_generation() != current_binding.generation_
+               || !adapter->validate_tablet_ids(current_binding.acquire_ctx_)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_INFO("stale vector index schema binding", K(ret), K(identity), K(current_binding), KPC(adapter));
+    } else if (OB_FAIL(adapter_guard.set_adapter(adapter))) {
+    } else if (!adapter_guard.generation_matches()) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("vector index adapter generation changed during schema lookup",
+               K(ret), K(identity), K(current_binding), K(adapter_guard));
+    } else if (OB_NOT_NULL(binding)) {
+      *binding = current_binding;
+    }
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexMgr::check_need_mem_data_sync_task(bool &need_sync)
 {
   need_sync = false;
@@ -567,10 +712,25 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObVectorIndexAcquireCtx &c
     } else if (!adaptor->validate_tablet_ids(ctx)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("validate tablet ids failed", K(ret), K(ctx), K(adaptor));
+    } else {
+      int tmp_ret = index_mgr->publish_schema_binding(*adaptor);
+      if (OB_SUCCESS == tmp_ret) {
+      } else if (OB_ENTRY_NOT_EXIST != tmp_ret && OB_TABLE_NOT_EXIST != tmp_ret
+                 && OB_STATE_NOT_MATCH != tmp_ret) {
+        LOG_WARN("failed to build vector index schema binding", K(tmp_ret), KPC(adaptor));
+      }
     }
   }
 
   return ret;
+}
+
+int ObPluginVectorIndexService::acquire_adapter_guard(
+    const ObVectorIndexSchemaIdentity &identity,
+    ObPluginVectorIndexAdapterGuard &adapter_guard,
+    ObVectorIndexSchemaBinding *binding)
+{
+  return single_index_mgr_->get_adapter_guard_by_schema(identity, adapter_guard, binding);
 }
 
 int ObPluginVectorIndexService::acquire_ivf_build_helper_guard(
@@ -1107,6 +1267,7 @@ int ObPluginVectorIndexMgr::replace_with_complete_adapter(ObVectorIndexAdapterCa
   bool is_hybrid = embedded_adapter_guard.is_valid();
   // create new adapter
   ObPluginVectorIndexAdaptor *new_adapter = nullptr;
+  ObPluginVectorIndexAdapterGuard publish_adapter_guard;
   bool set_success = false;
   void *adpt_buff = allocator.alloc(sizeof(ObPluginVectorIndexAdaptor));
   if (OB_ISNULL(adpt_buff)) {
@@ -1162,14 +1323,13 @@ int ObPluginVectorIndexMgr::replace_with_complete_adapter(ObVectorIndexAdapterCa
           } else {
             new_adapter = nullptr;
           }
-      } else {
-        set_success = true;
-        if (OB_FAIL(erase_partial_adapter_(new_adapter->get_inc_tablet_id()))) {
-        } else if (OB_FAIL(erase_partial_adapter_(new_adapter->get_vbitmap_tablet_id()))) {
-        } else if (OB_FAIL(erase_partial_adapter_(new_adapter->get_snap_tablet_id()))) {
-        } else if (is_hybrid && OB_FAIL(erase_partial_adapter_(new_adapter->get_embedded_tablet_id()))) {
-          LOG_WARN("fail to release partial index adapter", K(new_adapter->get_embedded_tablet_id()), KR(ret));
-        }
+      } else if (OB_FAIL(publish_adapter_guard.set_adapter(new_adapter))) {
+      } else if (FALSE_IT(set_success = true)) {
+      } else if (OB_FAIL(erase_partial_adapter_(new_adapter->get_inc_tablet_id()))) {
+      } else if (OB_FAIL(erase_partial_adapter_(new_adapter->get_vbitmap_tablet_id()))) {
+      } else if (OB_FAIL(erase_partial_adapter_(new_adapter->get_snap_tablet_id()))) {
+      } else if (is_hybrid && OB_FAIL(erase_partial_adapter_(new_adapter->get_embedded_tablet_id()))) {
+        LOG_WARN("fail to release partial index adapter", K(new_adapter->get_embedded_tablet_id()), KR(ret));
       }
     }
   }
@@ -1179,16 +1339,26 @@ int ObPluginVectorIndexMgr::replace_with_complete_adapter(ObVectorIndexAdapterCa
     new_adapter = nullptr;
     adpt_buff = nullptr;
   }
+  if (OB_SUCC(ret) && publish_adapter_guard.is_valid()) {
+    int tmp_ret = publish_schema_binding(*publish_adapter_guard.get_adatper());
+    if (OB_SUCCESS != tmp_ret && OB_ENTRY_NOT_EXIST != tmp_ret
+        && OB_TABLE_NOT_EXIST != tmp_ret && OB_STATE_NOT_MATCH != tmp_ret) {
+      LOG_WARN("failed to publish complete vector index schema binding",
+               K(tmp_ret), K(publish_adapter_guard));
+    }
+  }
   return ret;
 }
 
 int ObPluginVectorIndexMgr::replace_old_adapter(ObPluginVectorIndexAdaptor *new_adapter)
 {
   int ret = 0;
+  ObPluginVectorIndexAdapterGuard publish_adapter_guard;
   if (OB_ISNULL(new_adapter)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null adapter", KR(ret));
   } else {
+    WLockGuard lock_guard(adapter_map_rwlock_);
     int overwrite = 0;
     ObPluginVectorIndexAdaptor *old_adapter = nullptr;
     int tmp_ret = complete_index_adpt_map_.get_refactored(new_adapter->get_inc_tablet_id(), old_adapter);
@@ -1218,6 +1388,16 @@ int ObPluginVectorIndexMgr::replace_old_adapter(ObPluginVectorIndexAdaptor *new_
       if (OB_FAIL(erase_complete_adapter(new_adapter->get_embedded_tablet_id()))) {
       } else if (OB_FAIL(set_complete_adapter_(new_adapter->get_embedded_tablet_id(), new_adapter, overwrite))) {
       }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(publish_adapter_guard.set_adapter(new_adapter))) {
+    }
+  }
+  if (OB_SUCC(ret) && publish_adapter_guard.is_valid()) {
+    int tmp_ret = publish_schema_binding(*publish_adapter_guard.get_adatper());
+    if (OB_SUCCESS != tmp_ret && OB_ENTRY_NOT_EXIST != tmp_ret
+        && OB_TABLE_NOT_EXIST != tmp_ret && OB_STATE_NOT_MATCH != tmp_ret) {
+      LOG_WARN("failed to publish replaced vector index schema binding",
+               K(tmp_ret), K(publish_adapter_guard));
     }
   }
   return ret;

@@ -1765,6 +1765,85 @@ int ObVectorIndexUtil::get_vector_index_column_id(
   return ret;
 }
 
+int ObVectorIndexUtil::resolve_hnsw_schema_identity(
+    ObSchemaGetterGuard &schema_guard,
+    const ObTableSchema &data_table_schema,
+    uint64_t vector_column_id,
+    ObVectorIndexSchemaIdentity &identity)
+{
+  int ret = OB_SUCCESS;
+  uint64_t rowkey_vid_table_id = OB_INVALID_ID;
+  uint64_t vid_rowkey_table_id = OB_INVALID_ID;
+  uint64_t inc_table_id = OB_INVALID_ID;
+  uint64_t vbitmap_table_id = OB_INVALID_ID;
+  uint64_t snapshot_table_id = OB_INVALID_ID;
+  uint64_t embedded_table_id = OB_INVALID_ID;
+  const ObTableSchema *rowkey_vid_schema = nullptr;
+  const ObTableSchema *vid_rowkey_schema = nullptr;
+  const ObTableSchema *inc_schema = nullptr;
+  const ObTableSchema *vbitmap_schema = nullptr;
+  const ObTableSchema *snapshot_schema = nullptr;
+  identity.reset();
+  identity.data_table_id_ = data_table_schema.get_table_id();
+  identity.data_schema_version_ = data_table_schema.get_schema_version();
+  identity.vector_column_id_ = vector_column_id;
+  if (OB_UNLIKELY(identity.data_table_id_ == OB_INVALID_ID
+                  || identity.data_schema_version_ <= 0
+                  || vector_column_id == OB_INVALID_ID)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid hnsw schema identity input", K(ret), K(identity));
+  } else if (OB_FAIL(data_table_schema.get_rowkey_vid_tid(rowkey_vid_table_id))) {
+    if (OB_ERR_INDEX_KEY_NOT_FOUND == ret) {
+      ret = OB_ENTRY_NOT_EXIST;
+    }
+  } else if (OB_FAIL(data_table_schema.get_vec_id_rowkey_tid(vid_rowkey_table_id))) {
+    if (OB_ERR_INDEX_KEY_NOT_FOUND == ret) {
+      ret = OB_ENTRY_NOT_EXIST;
+    }
+  } else if (OB_FAIL(get_latest_avaliable_index_tids_for_hnsw(
+                 &schema_guard, data_table_schema, vector_column_id,
+                 inc_table_id, vbitmap_table_id, snapshot_table_id,
+                 embedded_table_id, false /* is_hybrid */))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(rowkey_vid_table_id, rowkey_vid_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(vid_rowkey_table_id, vid_rowkey_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(inc_table_id, inc_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(vbitmap_table_id, vbitmap_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(snapshot_table_id, snapshot_schema))) {
+  } else if (OB_ISNULL(rowkey_vid_schema) || OB_ISNULL(vid_rowkey_schema)
+             || OB_ISNULL(inc_schema) || OB_ISNULL(vbitmap_schema)
+             || OB_ISNULL(snapshot_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("hnsw auxiliary schema is null", K(ret), K(rowkey_vid_table_id),
+             K(vid_rowkey_table_id), K(inc_table_id), K(vbitmap_table_id),
+             K(snapshot_table_id));
+  } else if (OB_UNLIKELY(!rowkey_vid_schema->is_vec_rowkey_vid_type()
+                         || !vid_rowkey_schema->is_vec_vid_rowkey_type()
+                         || !inc_schema->is_vec_delta_buffer_type()
+                         || !vbitmap_schema->is_vec_index_id_type()
+                         || !snapshot_schema->is_vec_index_snapshot_data_type())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("hnsw auxiliary schema role mismatch", K(ret), KPC(rowkey_vid_schema),
+             KPC(vid_rowkey_schema), KPC(inc_schema), KPC(vbitmap_schema),
+             KPC(snapshot_schema));
+  } else {
+    identity.rowkey_vid_table_id_ = rowkey_vid_table_id;
+    identity.rowkey_vid_schema_version_ = rowkey_vid_schema->get_schema_version();
+    identity.vid_rowkey_table_id_ = vid_rowkey_table_id;
+    identity.vid_rowkey_schema_version_ = vid_rowkey_schema->get_schema_version();
+    identity.inc_table_id_ = inc_table_id;
+    identity.inc_schema_version_ = inc_schema->get_schema_version();
+    identity.vbitmap_table_id_ = vbitmap_table_id;
+    identity.vbitmap_schema_version_ = vbitmap_schema->get_schema_version();
+    identity.snapshot_table_id_ = snapshot_table_id;
+    identity.snapshot_schema_version_ = snapshot_schema->get_schema_version();
+  }
+  if (OB_SUCC(ret) && OB_UNLIKELY(!identity.is_valid())) {
+    ret = OB_ENTRY_NOT_EXIST;
+    LOG_INFO("complete hnsw schema identity is not available", K(ret), K(identity));
+  }
+  return ret;
+}
+
 int ObVectorIndexUtil::get_extra_info_column_id(
   const ObTableSchema &data_table_schema, const ObTableSchema &index_table_schema, ObSEArray<uint64_t, 4> &extra_col_ids)
 {

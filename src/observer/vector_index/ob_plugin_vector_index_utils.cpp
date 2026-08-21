@@ -904,7 +904,6 @@ int ObPluginVectorIndexUtils::refresh_memdata(ObPluginVectorIndexAdaptor *adapte
       }
       if (adapter != new_adapter && OB_NOT_NULL(new_adapter)) {
         if (OB_SUCC(ret)) {
-          RWLock::WLockGuard lock_guard(vec_idx_mgr->get_adapter_map_lock());
           if (OB_FAIL(vec_idx_mgr->replace_old_adapter(new_adapter))) {
           }
         }

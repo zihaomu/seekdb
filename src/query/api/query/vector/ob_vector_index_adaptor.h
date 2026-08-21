@@ -557,6 +557,141 @@ struct ObVectorIndexAcquireCtx
   TO_STRING_KV(K_(inc_tablet_id), K_(vbitmap_tablet_id), K_(snapshot_tablet_id), K_(data_tablet_id), K_(embedded_tablet_id));
 };
 
+struct ObVectorIndexSchemaIdentity final
+{
+  ObVectorIndexSchemaIdentity()
+  {
+    reset();
+  }
+
+  void reset()
+  {
+    data_table_id_ = OB_INVALID_ID;
+    data_schema_version_ = OB_INVALID_VERSION;
+    vector_column_id_ = OB_INVALID_ID;
+    rowkey_vid_table_id_ = OB_INVALID_ID;
+    rowkey_vid_schema_version_ = OB_INVALID_VERSION;
+    vid_rowkey_table_id_ = OB_INVALID_ID;
+    vid_rowkey_schema_version_ = OB_INVALID_VERSION;
+    inc_table_id_ = OB_INVALID_ID;
+    inc_schema_version_ = OB_INVALID_VERSION;
+    vbitmap_table_id_ = OB_INVALID_ID;
+    vbitmap_schema_version_ = OB_INVALID_VERSION;
+    snapshot_table_id_ = OB_INVALID_ID;
+    snapshot_schema_version_ = OB_INVALID_VERSION;
+  }
+
+  bool is_valid() const
+  {
+    return data_table_id_ != OB_INVALID_ID
+        && data_schema_version_ > 0
+        && vector_column_id_ != OB_INVALID_ID
+        && rowkey_vid_table_id_ != OB_INVALID_ID
+        && rowkey_vid_schema_version_ > 0
+        && vid_rowkey_table_id_ != OB_INVALID_ID
+        && vid_rowkey_schema_version_ > 0
+        && inc_table_id_ != OB_INVALID_ID
+        && inc_schema_version_ > 0
+        && vbitmap_table_id_ != OB_INVALID_ID
+        && vbitmap_schema_version_ > 0
+        && snapshot_table_id_ != OB_INVALID_ID
+        && snapshot_schema_version_ > 0;
+  }
+
+  uint64_t hash() const
+  {
+    uint64_t value = 0;
+    value = murmurhash(&data_table_id_, sizeof(data_table_id_), value);
+    value = murmurhash(&data_schema_version_, sizeof(data_schema_version_), value);
+    value = murmurhash(&vector_column_id_, sizeof(vector_column_id_), value);
+    value = murmurhash(&rowkey_vid_table_id_, sizeof(rowkey_vid_table_id_), value);
+    value = murmurhash(&rowkey_vid_schema_version_, sizeof(rowkey_vid_schema_version_), value);
+    value = murmurhash(&vid_rowkey_table_id_, sizeof(vid_rowkey_table_id_), value);
+    value = murmurhash(&vid_rowkey_schema_version_, sizeof(vid_rowkey_schema_version_), value);
+    value = murmurhash(&inc_table_id_, sizeof(inc_table_id_), value);
+    value = murmurhash(&inc_schema_version_, sizeof(inc_schema_version_), value);
+    value = murmurhash(&vbitmap_table_id_, sizeof(vbitmap_table_id_), value);
+    value = murmurhash(&vbitmap_schema_version_, sizeof(vbitmap_schema_version_), value);
+    value = murmurhash(&snapshot_table_id_, sizeof(snapshot_table_id_), value);
+    return murmurhash(&snapshot_schema_version_, sizeof(snapshot_schema_version_), value);
+  }
+
+  int hash(uint64_t &hash_val) const
+  {
+    hash_val = hash();
+    return OB_SUCCESS;
+  }
+
+  bool operator==(const ObVectorIndexSchemaIdentity &other) const
+  {
+    return data_table_id_ == other.data_table_id_
+        && data_schema_version_ == other.data_schema_version_
+        && vector_column_id_ == other.vector_column_id_
+        && rowkey_vid_table_id_ == other.rowkey_vid_table_id_
+        && rowkey_vid_schema_version_ == other.rowkey_vid_schema_version_
+        && vid_rowkey_table_id_ == other.vid_rowkey_table_id_
+        && vid_rowkey_schema_version_ == other.vid_rowkey_schema_version_
+        && inc_table_id_ == other.inc_table_id_
+        && inc_schema_version_ == other.inc_schema_version_
+        && vbitmap_table_id_ == other.vbitmap_table_id_
+        && vbitmap_schema_version_ == other.vbitmap_schema_version_
+        && snapshot_table_id_ == other.snapshot_table_id_
+        && snapshot_schema_version_ == other.snapshot_schema_version_;
+  }
+
+  TO_STRING_KV(K_(data_table_id), K_(data_schema_version), K_(vector_column_id),
+               K_(rowkey_vid_table_id), K_(rowkey_vid_schema_version),
+               K_(vid_rowkey_table_id), K_(vid_rowkey_schema_version),
+               K_(inc_table_id), K_(inc_schema_version),
+               K_(vbitmap_table_id), K_(vbitmap_schema_version),
+               K_(snapshot_table_id), K_(snapshot_schema_version));
+
+  uint64_t data_table_id_;
+  int64_t data_schema_version_;
+  uint64_t vector_column_id_;
+  uint64_t rowkey_vid_table_id_;
+  int64_t rowkey_vid_schema_version_;
+  uint64_t vid_rowkey_table_id_;
+  int64_t vid_rowkey_schema_version_;
+  uint64_t inc_table_id_;
+  int64_t inc_schema_version_;
+  uint64_t vbitmap_table_id_;
+  int64_t vbitmap_schema_version_;
+  uint64_t snapshot_table_id_;
+  int64_t snapshot_schema_version_;
+};
+
+struct ObVectorIndexSchemaBinding final
+{
+  ObVectorIndexSchemaBinding()
+    : acquire_ctx_(), generation_(0)
+  {}
+
+  bool is_valid() const
+  {
+    return acquire_ctx_.inc_tablet_id_.is_valid()
+        && acquire_ctx_.vbitmap_tablet_id_.is_valid()
+        && acquire_ctx_.snapshot_tablet_id_.is_valid()
+        && acquire_ctx_.data_tablet_id_.is_valid()
+        && generation_ > 0;
+  }
+
+  bool operator==(const ObVectorIndexSchemaBinding &other) const
+  {
+    return acquire_ctx_.inc_tablet_id_ == other.acquire_ctx_.inc_tablet_id_
+        && acquire_ctx_.vbitmap_tablet_id_ == other.acquire_ctx_.vbitmap_tablet_id_
+        && acquire_ctx_.snapshot_tablet_id_ == other.acquire_ctx_.snapshot_tablet_id_
+        && acquire_ctx_.data_tablet_id_ == other.acquire_ctx_.data_tablet_id_
+        && acquire_ctx_.embedded_tablet_id_ == other.acquire_ctx_.embedded_tablet_id_
+        && generation_ == other.generation_;
+  }
+
+  TO_STRING_KV(K_(acquire_ctx), K_(generation));
+
+  ObVectorIndexAcquireCtx acquire_ctx_;
+  uint64_t generation_;
+};
+
 class ObPluginVectorIndexAdaptor
 {
 public:
@@ -602,6 +737,14 @@ public:
   uint64_t get_rowkey_vid_table_id() { return rowkey_vid_table_id_; }
   uint64_t get_vid_rowkey_table_id() { return vid_rowkey_table_id_; }
   uint64_t get_generation() const { return generation_; }
+  bool try_begin_schema_binding_publish()
+  {
+    return ATOMIC_BCAS(&schema_binding_publish_state_, 0, 1);
+  }
+  void finish_schema_binding_publish(bool success)
+  {
+    ATOMIC_STORE(&schema_binding_publish_state_, success ? 2 : 0);
+  }
   void close_snap_data_rb_flag() {
     if (is_mem_data_init_atomic(VIRT_SNAP)) {
       snap_data_->rb_flag_ = false;
@@ -930,6 +1073,7 @@ private:
   uint64_t vid_rowkey_table_id_;
 
   uint64_t generation_;
+  int64_t schema_binding_publish_state_;
   int64_t ref_cnt_;
   int64_t idle_cnt_; // not merged cnt
   int64_t mem_check_cnt_;
