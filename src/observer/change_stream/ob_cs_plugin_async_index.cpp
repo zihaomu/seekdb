@@ -1112,6 +1112,10 @@ int ObCSAsyncIndexProcessor::write_to_vsag_(
     }
 
     if (OB_SUCC(ret)) {
+      if (schema::is_vec_delta_buffer_type(vec_info.index_type_)
+          || schema::is_vec_index_id_type(vec_info.index_type_)) {
+        adaptor->advance_data_epoch();
+      }
       ObVectorIndexMemData *incr_data = adaptor->get_incr_data();
       obvsag::VectorIndexPtr index_handler = nullptr;
       if (OB_ISNULL(incr_data) || !incr_data->is_inited()) {

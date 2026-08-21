@@ -581,6 +581,7 @@ int ObPluginVectorIndexMgr::build_schema_binding_(
     binding.acquire_ctx_.data_tablet_id_ = adapter.get_data_tablet_id();
     binding.acquire_ctx_.embedded_tablet_id_ = adapter.get_embedded_tablet_id();
     binding.generation_ = adapter.get_generation();
+    binding.data_epoch_ = adapter.get_data_epoch();
     if (OB_UNLIKELY(!binding.is_valid())) {
       ret = OB_ENTRY_NOT_EXIST;
       LOG_INFO("complete vector index binding is not available", K(ret), K(identity), K(binding));
@@ -671,11 +672,12 @@ int ObPluginVectorIndexMgr::get_adapter_guard_by_schema(
       ret = OB_STATE_NOT_MATCH;
       LOG_INFO("stale vector index schema binding", K(ret), K(identity), K(current_binding), KPC(adapter));
     } else if (OB_FAIL(adapter_guard.set_adapter(adapter))) {
-    } else if (!adapter_guard.generation_matches()) {
+    } else if (!adapter_guard.generation_matches() || !adapter_guard.data_epoch_matches()) {
       ret = OB_STATE_NOT_MATCH;
-      LOG_WARN("vector index adapter generation changed during schema lookup",
+      LOG_WARN("vector index adapter generation or data epoch changed during schema lookup",
                K(ret), K(identity), K(current_binding), K(adapter_guard));
     } else if (OB_NOT_NULL(binding)) {
+      current_binding.data_epoch_ = adapter_guard.get_data_epoch();
       *binding = current_binding;
     }
   }
@@ -1393,6 +1395,7 @@ int ObPluginVectorIndexMgr::replace_old_adapter(ObPluginVectorIndexAdaptor *new_
     }
   }
   if (OB_SUCC(ret) && publish_adapter_guard.is_valid()) {
+    publish_adapter_guard.get_adatper()->advance_data_epoch();
     int tmp_ret = publish_schema_binding(*publish_adapter_guard.get_adatper());
     if (OB_SUCCESS != tmp_ret && OB_ENTRY_NOT_EXIST != tmp_ret
         && OB_TABLE_NOT_EXIST != tmp_ret && OB_STATE_NOT_MATCH != tmp_ret) {

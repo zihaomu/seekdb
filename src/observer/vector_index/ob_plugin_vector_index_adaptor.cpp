@@ -464,6 +464,7 @@ ObPluginVectorIndexAdaptor::ObPluginVectorIndexAdaptor(common::ObIAllocator *all
     embedded_table_id_(OB_INVALID_ID),
     rowkey_vid_table_id_(OB_INVALID_ID), vid_rowkey_table_id_(OB_INVALID_ID),
     generation_(static_cast<uint64_t>(ATOMIC_AAF(&g_vector_index_adapter_generation, 1))),
+    epoch_state_(nullptr),
     schema_binding_publish_state_(0),
     ref_cnt_(0), idle_cnt_(0), mem_check_cnt_(0), is_mem_limited_(false), all_vsag_use_mem_(nullptr), allocator_(allocator),
     parent_mem_ctx_(entity), index_identity_(), follower_sync_statistics_(), is_in_opt_task_(false), need_be_optimized_(false), extra_info_column_count_(0),
@@ -494,6 +495,7 @@ ObPluginVectorIndexAdaptor::~ObPluginVectorIndexAdaptor()
     LOG_WARN("failed to free snap memdata", K(ret), KPC(this));
   }
 
+  release_epoch_state_();
   free_sparse_vector_type_mem();
 
   // use another memdata struct for the following?
@@ -511,6 +513,62 @@ ObPluginVectorIndexAdaptor::~ObPluginVectorIndexAdaptor()
       snapshot_key_prefix_.reset();
     }
   }
+}
+
+int ObPluginVectorIndexAdaptor::init_epoch_state_()
+{
+  int ret = OB_SUCCESS;
+  void *state_buf = nullptr;
+  if (OB_NOT_NULL(epoch_state_)) {
+  } else if (OB_ISNULL(allocator_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("adapter allocator is null", K(ret));
+  } else if (OB_ISNULL(state_buf = allocator_->alloc(sizeof(ObVectorIndexEpochState)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate vector index epoch state", K(ret));
+  } else {
+    epoch_state_ = new(state_buf) ObVectorIndexEpochState(allocator_);
+  }
+  return ret;
+}
+
+void ObPluginVectorIndexAdaptor::release_epoch_state_()
+{
+  if (OB_NOT_NULL(epoch_state_)) {
+    ObVectorIndexEpochState *state = epoch_state_;
+    epoch_state_ = nullptr;
+    if (state->dec_ref_and_check_release()) {
+      ObIAllocator *allocator = state->get_allocator();
+      state->~ObVectorIndexEpochState();
+      if (OB_NOT_NULL(allocator)) {
+        allocator->free(state);
+      }
+    }
+  }
+}
+
+int ObPluginVectorIndexAdaptor::share_epoch_state_(ObPluginVectorIndexAdaptor &other)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(other.epoch_state_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("source vector index epoch state is null", K(ret), KPC(&other));
+  } else if (epoch_state_ != other.epoch_state_) {
+    release_epoch_state_();
+    epoch_state_ = other.epoch_state_;
+    epoch_state_->inc_ref();
+  }
+  return ret;
+}
+
+uint64_t ObPluginVectorIndexAdaptor::get_data_epoch() const
+{
+  return OB_ISNULL(epoch_state_) ? 0 : epoch_state_->get_data_epoch();
+}
+
+uint64_t ObPluginVectorIndexAdaptor::advance_data_epoch()
+{
+  return OB_ISNULL(epoch_state_) ? 0 : epoch_state_->advance_data_epoch();
 }
 
 int ObPluginVectorIndexAdaptor::init_mem(ObVectorIndexMemData *&table_info)
@@ -564,6 +622,7 @@ int ObPluginVectorIndexAdaptor::init(lib::MemoryContext &parent_mem_ctx, uint64_
   if (OB_ISNULL(get_allocator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("adaptor allocator invalid.", K(ret));
+  } else if (OB_FAIL(init_epoch_state_())) {
   } else if (OB_FAIL(init_mem(incr_data_))) {
   } else if (OB_FAIL(init_mem(vbitmap_data_))) {
   } else if (OB_FAIL(init_mem(snap_data_))) {
@@ -584,6 +643,7 @@ int ObPluginVectorIndexAdaptor::init(ObString init_str, int64_t dim, lib::Memory
   if (OB_ISNULL(get_allocator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("adaptor allocator invalid.", K(ret));
+  } else if (OB_FAIL(init_epoch_state_())) {
   } else if (OB_FAIL(init_mem(incr_data_))) {
   } else if (OB_FAIL(init_mem(vbitmap_data_))) {
   } else if (OB_FAIL(init_mem(snap_data_))) {
@@ -1473,6 +1533,7 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to get param.", K(ret));
   } else {
+    advance_data_epoch();
     uint64_t incr_vid_count = 0;
     uint64_t del_vid_count = 0;
     uint64_t null_vid_count = 0;
@@ -2075,7 +2136,8 @@ int ObPluginVectorIndexAdaptor::copy_meta_info(ObPluginVectorIndexAdaptor &other
   follower_sync_statistics_.sync_count_ = other.follower_sync_statistics_.sync_count_;
   follower_sync_statistics_.sync_fail_ = other.follower_sync_statistics_.sync_fail_;
   is_need_vid_ = other.is_need_vid_;
-  if (OB_NOT_NULL(algo_data_)) {
+  if (OB_FAIL(share_epoch_state_(other))) {
+  } else if (OB_NOT_NULL(algo_data_)) {
     // do nothing
   } else if (OB_ISNULL(get_allocator())) {
     ret = OB_INVALID_ARGUMENT;
@@ -4492,6 +4554,7 @@ int ObPluginVectorIndexAdaptor::merge_parital_index_adapter(ObPluginVectorIndexA
     // do nothing
   } else if (partial_idx_adpt == this) {
     // merge self, do nothing
+  } else if (partial_idx_adpt->is_inc_tablet_valid() && OB_FAIL(share_epoch_state_(*partial_idx_adpt))) {
   } else {
     if (partial_idx_adpt->is_inc_tablet_valid()) {
       if (OB_FAIL(set_tablet_id(VIRT_INC, partial_idx_adpt->get_inc_tablet_id()))) {

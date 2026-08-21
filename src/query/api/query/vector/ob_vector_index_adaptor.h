@@ -413,6 +413,25 @@ enum ObCanSkip3rdAnd4thVecIndex
   SKIPMAX
 };
 
+struct ObVectorIndexEpochState
+{
+  explicit ObVectorIndexEpochState(common::ObIAllocator *allocator)
+    : data_epoch_(1), ref_cnt_(1), allocator_(allocator)
+  {}
+
+  uint64_t get_data_epoch() { return ATOMIC_LOAD(&data_epoch_); }
+  uint64_t advance_data_epoch() { return ATOMIC_AAF(&data_epoch_, 1); }
+  void inc_ref() { ATOMIC_INC(&ref_cnt_); }
+  bool dec_ref_and_check_release() { return ATOMIC_SAF(&ref_cnt_, 1) == 0; }
+  common::ObIAllocator *get_allocator() { return allocator_; }
+
+  TO_STRING_KV(K_(data_epoch), K_(ref_cnt), KP_(allocator));
+
+  uint64_t data_epoch_;
+  int64_t ref_cnt_;
+  common::ObIAllocator *allocator_;
+};
+
 struct ObVectorIndexMemData
 {
   ObVectorIndexMemData()
@@ -664,7 +683,7 @@ struct ObVectorIndexSchemaIdentity final
 struct ObVectorIndexSchemaBinding final
 {
   ObVectorIndexSchemaBinding()
-    : acquire_ctx_(), generation_(0)
+    : acquire_ctx_(), generation_(0), data_epoch_(0)
   {}
 
   bool is_valid() const
@@ -673,7 +692,8 @@ struct ObVectorIndexSchemaBinding final
         && acquire_ctx_.vbitmap_tablet_id_.is_valid()
         && acquire_ctx_.snapshot_tablet_id_.is_valid()
         && acquire_ctx_.data_tablet_id_.is_valid()
-        && generation_ > 0;
+        && generation_ > 0
+        && data_epoch_ > 0;
   }
 
   bool operator==(const ObVectorIndexSchemaBinding &other) const
@@ -683,13 +703,15 @@ struct ObVectorIndexSchemaBinding final
         && acquire_ctx_.snapshot_tablet_id_ == other.acquire_ctx_.snapshot_tablet_id_
         && acquire_ctx_.data_tablet_id_ == other.acquire_ctx_.data_tablet_id_
         && acquire_ctx_.embedded_tablet_id_ == other.acquire_ctx_.embedded_tablet_id_
-        && generation_ == other.generation_;
+        && generation_ == other.generation_
+        && data_epoch_ == other.data_epoch_;
   }
 
-  TO_STRING_KV(K_(acquire_ctx), K_(generation));
+  TO_STRING_KV(K_(acquire_ctx), K_(generation), K_(data_epoch));
 
   ObVectorIndexAcquireCtx acquire_ctx_;
   uint64_t generation_;
+  uint64_t data_epoch_;
 };
 
 class ObPluginVectorIndexAdaptor
@@ -737,6 +759,8 @@ public:
   uint64_t get_rowkey_vid_table_id() { return rowkey_vid_table_id_; }
   uint64_t get_vid_rowkey_table_id() { return vid_rowkey_table_id_; }
   uint64_t get_generation() const { return generation_; }
+  uint64_t get_data_epoch() const;
+  uint64_t advance_data_epoch();
   bool try_begin_schema_binding_publish()
   {
     return ATOMIC_BCAS(&schema_binding_publish_state_, 0, 1);
@@ -1026,6 +1050,9 @@ private:
   int print_bitmap(roaring::api::roaring64_bitmap_t *bitmap);
   void print_sparse_vectors(uint32_t *lens, uint32_t *dims, float *vals, int64_t count);
 
+  int init_epoch_state_();
+  int share_epoch_state_(ObPluginVectorIndexAdaptor &other);
+  void release_epoch_state_();
   int merge_mem_data_(ObVectorIndexRecordType type,
                       ObPluginVectorIndexAdaptor *partial_idx_adpt,
                       ObVectorIndexMemData *&src_mem_data,
@@ -1073,6 +1100,7 @@ private:
   uint64_t vid_rowkey_table_id_;
 
   uint64_t generation_;
+  ObVectorIndexEpochState *epoch_state_;
   int64_t schema_binding_publish_state_;
   int64_t ref_cnt_;
   int64_t idle_cnt_; // not merged cnt
@@ -1111,7 +1139,7 @@ class ObPluginVectorIndexAdapterGuard
 {
 public:
   ObPluginVectorIndexAdapterGuard()
-    : adapter_(nullptr), generation_(0)
+    : adapter_(nullptr), generation_(0), data_epoch_(0)
   {}
   ~ObPluginVectorIndexAdapterGuard()
   {
@@ -1129,15 +1157,21 @@ public:
       }
       adapter_ = nullptr;
       generation_ = 0;
+      data_epoch_ = 0;
     }
   }
 
   bool is_valid() { return adapter_ != nullptr; }
   ObPluginVectorIndexAdaptor* get_adatper() { return adapter_; }
   uint64_t get_generation() const { return generation_; }
+  uint64_t get_data_epoch() const { return data_epoch_; }
   bool generation_matches() const
   {
     return OB_NOT_NULL(adapter_) && generation_ == adapter_->get_generation();
+  }
+  bool data_epoch_matches() const
+  {
+    return OB_NOT_NULL(adapter_) && data_epoch_ == adapter_->get_data_epoch();
   }
   int set_adapter(ObPluginVectorIndexAdaptor *adapter)
   {
@@ -1152,14 +1186,16 @@ public:
       adapter_ = adapter;
       generation_ = adapter_->get_generation();
       (void)adapter_->inc_ref();
+      data_epoch_ = adapter_->get_data_epoch();
     }
     return ret;
   }
-  TO_STRING_KV(KPC_(adapter), K_(generation));
+  TO_STRING_KV(KPC_(adapter), K_(generation), K_(data_epoch));
 
 private:
   ObPluginVectorIndexAdaptor *adapter_;
   uint64_t generation_;
+  uint64_t data_epoch_;
 };
 
 void free_hnswsq_array_data(ObVectorIndexMemData *&memdata, ObIAllocator *allocator);
