@@ -10,6 +10,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -75,6 +76,51 @@ done:
   if (qd) cuvsRMMFree(h->res, qd, sizeof(float)*nq*h->dim);
   if (rc) fprintf(stderr, "[seekdb_cuvs] search rc=%d: %s\n", rc, cuvsGetLastErrorText());
   return rc;
+}
+
+static size_t estimate_payload_bytes(int64_t n, int64_t dim, int64_t graph_degree)
+{
+  if (n <= 0 || dim <= 0 || graph_degree <= 0
+      || (size_t)dim > (SIZE_MAX - 15U) / sizeof(float)) {
+    return 0;
+  }
+  const size_t row_bytes = (size_t)dim * sizeof(float);
+  const size_t aligned_row_bytes = (row_bytes + 15U) & ~(size_t)15U;
+  if ((size_t)graph_degree > SIZE_MAX / sizeof(uint32_t)) {
+    return 0;
+  }
+  const size_t graph_row_bytes = (size_t)graph_degree * sizeof(uint32_t);
+  if (aligned_row_bytes > SIZE_MAX - graph_row_bytes) {
+    return 0;
+  }
+  const size_t bytes_per_row = aligned_row_bytes + graph_row_bytes;
+  return (size_t)n > SIZE_MAX / bytes_per_row ? 0 : (size_t)n * bytes_per_row;
+}
+
+size_t seekdb_cuvs_estimate_build_bytes(long n, long dim)
+{
+  cuvsCagraIndexParams_t params = 0;
+  size_t bytes = 0;
+  if (n > 0 && dim > 0 && cuvsCagraIndexParamsCreate(&params) == CUVS_SUCCESS) {
+    bytes = estimate_payload_bytes(n, dim, (int64_t)params->graph_degree);
+    cuvsCagraIndexParamsDestroy(params);
+  }
+  return bytes;
+}
+
+size_t seekdb_cuvs_estimated_bytes(void* handle)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  int64_t n = 0;
+  int64_t dim = 0;
+  int64_t graph_degree = 0;
+  if (!h || cuvsCagraIndexGetSize(h->idx, &n) != CUVS_SUCCESS
+      || cuvsCagraIndexGetDims(h->idx, &dim) != CUVS_SUCCESS
+      || cuvsCagraIndexGetGraphDegree(h->idx, &graph_degree) != CUVS_SUCCESS
+      || n <= 0 || dim <= 0 || graph_degree <= 0) {
+    return 0;
+  }
+  return estimate_payload_bytes(n, dim, graph_degree);
 }
 
 void seekdb_cuvs_free(void* handle)
