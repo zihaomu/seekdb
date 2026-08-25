@@ -21,6 +21,11 @@
 #include "sql/engine/cmd/ob_vector_refresh_index_executor.h"
 #include "lib/vector/ob_vsag_adaptor.h"
 #include "share/ob_lob_access_utils.h"
+#include "query/vector/ob_vector_index_service.h"
+#include "query/vector/ob_vector_index_util.h"
+#include "share/rc/ob_server_runtime.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_table_schema.h"
 #include <vector>
 #include <cstdlib>
 
@@ -511,6 +516,56 @@ int ObDBMSVectorMySql::print_mem_size(uint64_t mem_size, ObStringBuffer &res_buf
   return ret;
 }
 
+static int batch_knn_resolve_index(
+    const common::ObString &db,
+    const common::ObString &table,
+    share::ObVectorIndexSchemaIdentity &identity,
+    query::ObIVectorIndexService *&service)
+{
+  int ret = OB_SUCCESS;
+  share::schema::ObSchemaGetterGuard schema_guard;
+  const share::schema::ObTableSchema *table_schema = nullptr;
+  const share::schema::ObColumnSchemaV2 *vector_column = nullptr;
+  int64_t visible_column_index = 0;
+  service = ::oceanbase::share::server_service<query::ObIVectorIndexService>();
+  if (db.empty() || table.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(service)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("batch_knn: vector index services are not initialized", K(ret),
+             KP(GCTX.schema_service_), KP(service));
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+    LOG_WARN("batch_knn: failed to get schema guard", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(db, table, false, table_schema))) {
+    LOG_WARN("batch_knn: failed to resolve base table", K(ret), K(db), K(table));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else {
+    for (share::schema::ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const share::schema::ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!column->is_hidden()) {
+        if (visible_column_index == 1) {
+          vector_column = column;
+          break;
+        }
+        ++visible_column_index;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(vector_column) || !vector_column->is_collection()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("batch_knn: second visible column is not a vector", K(ret), K(db), K(table));
+    } else if (OB_FAIL(share::ObVectorIndexUtil::resolve_hnsw_schema_identity(
+                   schema_guard, *table_schema, vector_column->get_column_id(), identity))) {
+      LOG_WARN("batch_knn: failed to resolve HNSW identity", K(ret), K(db), K(table));
+    }
+  }
+  return ret;
+}
+
 
 // ---- [hipVS/cuVS] dbms_vector.batch_knn: SQL-callable BATCHED ANN ----
 // Reads probe + index vectors from SQL, builds one CAGRA over the index table,
@@ -594,6 +649,107 @@ static int batch_knn_read_vectors(const common::ObString &db,
   return ret;
 }
 
+static int batch_knn_fresh_raw(
+    const common::ObString &db,
+    const common::ObString &index_table,
+    const std::vector<float> &query,
+    int64_t nq,
+    int qdim,
+    int64_t requested_topk,
+    std::vector<float> &base,
+    std::vector<int64_t> &base_ids,
+    std::vector<int64_t> &neighbor_ids,
+    std::vector<float> &dist,
+    int64_t &n,
+    int &bdim,
+    int64_t &topk)
+{
+  int ret = OB_SUCCESS;
+  bool completed = false;
+  const int64_t MAX_BINDING_RETRY_CNT = 1;
+  for (int64_t attempt = 0;
+       OB_SUCC(ret) && !completed && attempt <= MAX_BINDING_RETRY_CNT;
+       ++attempt) {
+    base.clear();
+    base_ids.clear();
+    neighbor_ids.clear();
+    dist.clear();
+    n = 0;
+    bdim = 0;
+    topk = requested_topk;
+
+    share::ObVectorIndexSchemaIdentity identity;
+    share::ObVectorIndexSchemaBinding binding;
+    query::ObIVectorIndexService *service = nullptr;
+    bool cache_ready = false;
+    int64_t cached_row_count = 0;
+    int64_t cached_dim = 0;
+    int binding_ret = batch_knn_resolve_index(db, index_table, identity, service);
+    if (OB_SUCCESS == binding_ret) {
+      binding_ret = service->check_cuvs_batch_index(
+          identity, binding, cache_ready, cached_row_count, cached_dim);
+    }
+    if (OB_STATE_NOT_MATCH == binding_ret) {
+      if (attempt < MAX_BINDING_RETRY_CNT) {
+        LOG_INFO("batch_knn: retry fresh raw after binding changed during resolve",
+                 K(attempt), K(identity));
+        continue;
+      }
+      ret = binding_ret;
+    } else {
+      const bool validate_binding = OB_SUCCESS == binding_ret && binding.is_valid();
+      if (!validate_binding) {
+        LOG_INFO("batch_knn: fresh raw has no stable index binding",
+                 K(binding_ret), K(index_table));
+      }
+      if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim))) {
+      } else if (base_ids.empty() || bdim <= 0 || bdim != qdim) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("batch_knn: fresh raw base is empty or dimension mismatched",
+                 K(ret), K(base_ids.size()), K(bdim), K(qdim));
+      } else {
+        n = static_cast<int64_t>(base_ids.size());
+        topk = requested_topk < n ? requested_topk : n;
+        neighbor_ids.resize(static_cast<size_t>(nq) * topk);
+        dist.resize(static_cast<size_t>(nq) * topk);
+        std::vector<unsigned> offsets(static_cast<size_t>(nq) * topk);
+        const long served = common::obvsag::cuvs_batch_knn(
+            base.data(), n, bdim, query.data(), nq, topk,
+            offsets.data(), dist.data());
+        if (served != nq) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("batch_knn: fresh raw GPU backend did not serve",
+                   K(ret), K(served), K(nq));
+        } else {
+          for (size_t i = 0; i < offsets.size(); ++i) {
+            neighbor_ids[i] = offsets[i] < base_ids.size()
+                ? base_ids[offsets[i]] : -1;
+          }
+          if (validate_binding) {
+            binding_ret = service->validate_cuvs_batch_binding(identity, binding);
+          }
+          if (validate_binding && OB_SUCCESS != binding_ret) {
+            neighbor_ids.clear();
+            dist.clear();
+            if (attempt < MAX_BINDING_RETRY_CNT) {
+              LOG_INFO("batch_knn: retry fresh raw after post-search binding change",
+                       K(binding_ret), K(attempt), K(identity), K(binding));
+              continue;
+            }
+            ret = binding_ret;
+          } else {
+            completed = true;
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !completed) {
+    ret = OB_STATE_NOT_MATCH;
+  }
+  return ret;
+}
+
 int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   UNUSED(result);
@@ -620,28 +776,144 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
       std::vector<float> query;
       std::vector<int64_t> base_ids;
       std::vector<int64_t> probe_ids;
+      std::vector<int64_t> neighbor_ids;
+      std::vector<float> dist;
+      share::ObVectorIndexSchemaIdentity identity;
+      share::ObVectorIndexSchemaBinding binding;
+      query::ObIVectorIndexService *service = nullptr;
+      int64_t n = 0;
+      int64_t nq = 0;
+      const int64_t requested_topk = topk;
+      bool cache_candidate = false;
+      bool cache_ready = false;
+      bool cache_served = false;
+      bool warm_hit = false;
+      bool base_scanned = false;
+      int64_t cached_row_count = 0;
+      int64_t cached_dim = 0;
+
       int bdim = 0;
       int qdim = 0;
       if (db.empty()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("batch_knn: no database selected", K(ret));
-      } else if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim))) {
-      } else if (OB_FAIL(batch_knn_read_vectors(db, probe_table, query, probe_ids, qdim))) {
-      } else if (base_ids.empty() || probe_ids.empty() || bdim == 0 || bdim != qdim) {
+      } else if (requested_topk <= 0) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("batch_knn: empty or dim mismatch", K(ret), K(base_ids.size()), K(probe_ids.size()), K(bdim), K(qdim));
+        LOG_WARN("batch_knn: topk must be positive", K(ret), K(requested_topk));
       } else {
-        if (topk > static_cast<int64_t>(base_ids.size())) { topk = static_cast<int64_t>(base_ids.size()); }
-        const long n = static_cast<long>(base_ids.size());
-        const long nq = static_cast<long>(probe_ids.size());
-        std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
-        std::vector<float> dist(static_cast<size_t>(nq) * topk);
-        const long served = common::obvsag::cuvs_batch_knn(base.data(), n, bdim,
-                                query.data(), nq, topk, off.data(), dist.data());
-        if (served != nq) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_WARN("batch_knn: GPU backend did not serve", K(ret), K(served), K(nq));
+        int cache_ret = batch_knn_resolve_index(db, index_table, identity, service);
+        if (OB_SUCCESS == cache_ret) {
+          cache_ret = service->check_cuvs_batch_index(
+              identity, binding, cache_ready, cached_row_count, cached_dim);
+          cache_candidate = OB_SUCCESS == cache_ret && binding.is_valid();
+        }
+        if (!cache_candidate) {
+          LOG_INFO("batch_knn: per-index cache unavailable", K(cache_ret), K(index_table));
+        }
+
+        if (OB_FAIL(batch_knn_read_vectors(db, probe_table, query, probe_ids, qdim))) {
+        } else if (probe_ids.empty() || qdim <= 0) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("batch_knn: empty probe table", K(ret), K(probe_ids.size()), K(qdim));
+        } else if (cache_ready && qdim != cached_dim) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("batch_knn: probe dimension does not match cached index",
+                   K(ret), K(qdim), K(cached_dim));
         } else {
+          nq = static_cast<int64_t>(probe_ids.size());
+          if (cache_ready) {
+            topk = requested_topk < cached_row_count ? requested_topk : cached_row_count;
+            neighbor_ids.resize(static_cast<size_t>(nq) * topk);
+            dist.resize(static_cast<size_t>(nq) * topk);
+            bool served = false;
+            cache_ret = service->search_cuvs_batch_index(
+                identity, binding, query.data(), nq, qdim, topk,
+                neighbor_ids.data(), dist.data(), served);
+            if (OB_SUCCESS == cache_ret && served) {
+              cache_served = true;
+              warm_hit = true;
+              n = cached_row_count;
+              bdim = static_cast<int>(cached_dim);
+            } else {
+              neighbor_ids.clear();
+              dist.clear();
+              LOG_INFO("batch_knn: warm cache miss during search",
+                       K(cache_ret), K(served), K(identity), K(binding));
+            }
+          }
+
+          if (OB_SUCC(ret) && !cache_served) {
+            topk = requested_topk;
+            if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim))) {
+            } else if (base_ids.empty() || bdim <= 0 || bdim != qdim) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("batch_knn: empty base or dimension mismatch",
+                       K(ret), K(base_ids.size()), K(bdim), K(qdim));
+            } else {
+              base_scanned = true;
+              n = static_cast<int64_t>(base_ids.size());
+              topk = topk < n ? topk : n;
+              neighbor_ids.resize(static_cast<size_t>(nq) * topk);
+              dist.resize(static_cast<size_t>(nq) * topk);
+              if (cache_candidate) {
+                bool prepared = false;
+                cache_ret = service->prepare_cuvs_batch_index(
+                    identity, binding, base.data(), base_ids.data(), n, bdim, prepared);
+                if (OB_SUCCESS == cache_ret && prepared) {
+                  bool served = false;
+                  cache_ret = service->search_cuvs_batch_index(
+                      identity, binding, query.data(), nq, qdim, topk,
+                      neighbor_ids.data(), dist.data(), served);
+                  cache_served = OB_SUCCESS == cache_ret && served;
+                }
+                if (!cache_served) {
+                  LOG_INFO("batch_knn: cold cache prepare/search unavailable",
+                           K(cache_ret), K(prepared), K(identity), K(binding));
+                }
+              }
+              if (!cache_served) {
+                std::vector<unsigned> offsets(static_cast<size_t>(nq) * topk);
+                const long served = common::obvsag::cuvs_batch_knn(
+                    base.data(), n, bdim, query.data(), nq, topk,
+                    offsets.data(), dist.data());
+                if (served != nq) {
+                  ret = OB_NOT_SUPPORTED;
+                  LOG_WARN("batch_knn: GPU backend did not serve",
+                           K(ret), K(served), K(nq));
+                } else {
+                  for (size_t i = 0; i < offsets.size(); ++i) {
+                    neighbor_ids[i] = offsets[i] < base_ids.size()
+                        ? base_ids[offsets[i]] : -1;
+                  }
+                }
+              }
+            }
+          }
+        }
+        bool need_fresh_raw = OB_STATE_NOT_MATCH == cache_ret;
+        if (OB_SUCC(ret) && !need_fresh_raw && cache_candidate
+            && (cache_served || !neighbor_ids.empty())) {
+          const int validate_ret = service->validate_cuvs_batch_binding(identity, binding);
+          need_fresh_raw = OB_SUCCESS != validate_ret;
+          if (need_fresh_raw) {
+            LOG_INFO("batch_knn: discard candidate after final binding validation",
+                     K(validate_ret), K(identity), K(binding));
+          }
+        }
+        if (OB_SUCC(ret) && need_fresh_raw) {
+          neighbor_ids.clear();
+          dist.clear();
+          if (OB_FAIL(batch_knn_fresh_raw(
+                  db, index_table, query, nq, qdim, requested_topk,
+                  base, base_ids, neighbor_ids, dist, n, bdim, topk))) {
+            LOG_WARN("batch_knn: fresh raw retry failed", K(ret), K(identity), K(binding));
+          } else {
+            cache_served = false;
+            warm_hit = false;
+            base_scanned = true;
+          }
+        }
+        if (OB_SUCC(ret) && (cache_served || !neighbor_ids.empty())) {
           int64_t affected = 0;
           common::ObSqlString del;
           if (OB_FAIL(del.assign_fmt("DELETE FROM `%.*s`.`%.*s`",
@@ -661,11 +933,9 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
             for (; OB_SUCC(ret) && q < nq && rows_in_stmt < CHUNK; ++q) {
               for (long i = 0; OB_SUCC(ret) && i < topk; ++i) {
                 const size_t pidx = static_cast<size_t>(q) * topk + i;
-                const unsigned o = off[pidx];
-                const int64_t nid = (o < base_ids.size()) ? base_ids[o] : -1;
                 if (OB_FAIL(ins.append_fmt("%s(%ld,%ld,%.6f,%ld)",
                                (rows_in_stmt > 0) ? "," : "",
-                               static_cast<long>(probe_ids[q]), static_cast<long>(nid),
+                               static_cast<long>(probe_ids[q]), static_cast<long>(neighbor_ids[pidx]),
                                dist[pidx], static_cast<long>(i)))) {
                 } else {
                   rows_in_stmt++;
@@ -676,7 +946,10 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
               LOG_WARN("batch_knn: insert failed", K(ret));
             }
           }
-          if (OB_SUCC(ret)) { LOG_INFO("batch_knn done", K(n), K(nq), K(topk), K(bdim)); }
+          if (OB_SUCC(ret)) {
+            LOG_INFO("batch_knn done", K(n), K(nq), K(topk), K(bdim),
+                     K(warm_hit), K(cache_served), K(base_scanned));
+          }
         }
       }
     }

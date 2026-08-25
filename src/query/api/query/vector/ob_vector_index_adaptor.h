@@ -974,6 +974,27 @@ public:
   bool get_reload_finish() { return reload_finish_; };
   int get_inc_index_row_cnt(int64_t &count);
   int get_snap_index_row_cnt(int64_t &count);
+  int check_cuvs_batch_index(uint64_t expected_generation,
+                             uint64_t expected_epoch,
+                             bool &ready,
+                             int64_t &row_count,
+                             int64_t &dim);
+  int prepare_cuvs_batch_index(uint64_t expected_generation,
+                               uint64_t expected_epoch,
+                               const float *base,
+                               const int64_t *ids,
+                               int64_t row_count,
+                               int64_t dim,
+                               bool &prepared);
+  int search_cuvs_batch_index(uint64_t expected_generation,
+                              uint64_t expected_epoch,
+                              const float *queries,
+                              int64_t query_count,
+                              int64_t dim,
+                              int64_t topk,
+                              int64_t *out_ids,
+                              float *out_distances,
+                              bool &served);
   common::RWLock& get_query_lock() { return query_lock_; }
   common::ObSpinLock& get_reload_lock() { return reload_lock_; }
   bool is_hybrid_index();
@@ -1053,6 +1074,7 @@ private:
   int init_epoch_state_();
   int share_epoch_state_(ObPluginVectorIndexAdaptor &other);
   void release_epoch_state_();
+  bool is_cuvs_batch_supported_();
   int merge_mem_data_(ObVectorIndexRecordType type,
                       ObPluginVectorIndexAdaptor *partial_idx_adpt,
                       ObVectorIndexMemData *&src_mem_data,

@@ -42,6 +42,33 @@ public:
       const share::ObVectorIndexSchemaIdentity &identity,
       share::ObPluginVectorIndexAdapterGuard &adapter_guard,
       share::ObVectorIndexSchemaBinding *binding = nullptr) = 0;
+  virtual int validate_cuvs_batch_binding(
+      const share::ObVectorIndexSchemaIdentity &identity,
+      const share::ObVectorIndexSchemaBinding &expected_binding) = 0;
+  virtual int check_cuvs_batch_index(
+      const share::ObVectorIndexSchemaIdentity &identity,
+      share::ObVectorIndexSchemaBinding &binding,
+      bool &ready,
+      int64_t &row_count,
+      int64_t &dim) = 0;
+  virtual int prepare_cuvs_batch_index(
+      const share::ObVectorIndexSchemaIdentity &identity,
+      const share::ObVectorIndexSchemaBinding &expected_binding,
+      const float *base,
+      const int64_t *ids,
+      int64_t row_count,
+      int64_t dim,
+      bool &prepared) = 0;
+  virtual int search_cuvs_batch_index(
+      const share::ObVectorIndexSchemaIdentity &identity,
+      const share::ObVectorIndexSchemaBinding &expected_binding,
+      const float *queries,
+      int64_t query_count,
+      int64_t dim,
+      int64_t topk,
+      int64_t *out_ids,
+      float *out_distances,
+      bool &served) = 0;
 
   virtual int acquire_ivf_cache_mgr_guard(
       const share::ObIvfCacheMgrKey &key,

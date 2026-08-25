@@ -735,6 +735,153 @@ int ObPluginVectorIndexService::acquire_adapter_guard(
   return single_index_mgr_->get_adapter_guard_by_schema(identity, adapter_guard, binding);
 }
 
+int ObPluginVectorIndexService::validate_cuvs_batch_binding(
+    const ObVectorIndexSchemaIdentity &identity,
+    const ObVectorIndexSchemaBinding &expected_binding)
+{
+  return validate_cuvs_batch_binding_(identity, expected_binding);
+}
+
+int ObPluginVectorIndexService::validate_cuvs_batch_binding_(
+    const ObVectorIndexSchemaIdentity &identity,
+    const ObVectorIndexSchemaBinding &expected_binding)
+{
+  int ret = OB_SUCCESS;
+  ObPluginVectorIndexAdapterGuard guard;
+  ObVectorIndexSchemaBinding current_binding;
+  if (!expected_binding.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(acquire_adapter_guard(identity, guard, &current_binding))) {
+    LOG_WARN("failed to reacquire cuVS batch owner", K(ret), K(identity));
+  } else if (!guard.is_valid() || !guard.generation_matches()
+             || !guard.data_epoch_matches() || !(current_binding == expected_binding)) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_INFO("cuVS batch owner changed", K(ret), K(identity),
+             K(expected_binding), K(current_binding), K(guard));
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::check_cuvs_batch_index(
+    const ObVectorIndexSchemaIdentity &identity,
+    ObVectorIndexSchemaBinding &binding,
+    bool &ready,
+    int64_t &row_count,
+    int64_t &dim)
+{
+  int ret = OB_SUCCESS;
+  ready = false;
+  row_count = 0;
+  dim = 0;
+  binding = ObVectorIndexSchemaBinding();
+  ObPluginVectorIndexAdapterGuard guard;
+  ObVectorIndexSchemaBinding current_binding;
+  ObPluginVectorIndexAdaptor *adapter = nullptr;
+  if (!identity.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(acquire_adapter_guard(identity, guard, &current_binding))) {
+    LOG_WARN("failed to acquire cuVS batch owner", K(ret), K(identity));
+  } else if (OB_ISNULL(adapter = guard.get_adatper())
+             || !current_binding.is_valid()
+             || current_binding.generation_ != guard.get_generation()
+             || current_binding.data_epoch_ != guard.get_data_epoch()
+             || !guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(adapter->check_cuvs_batch_index(
+                 current_binding.generation_, current_binding.data_epoch_, ready, row_count, dim))) {
+    LOG_WARN("failed to check cuVS batch index", K(ret), K(identity), K(current_binding));
+  } else if (!guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(validate_cuvs_batch_binding_(identity, current_binding))) {
+  } else {
+    binding = current_binding;
+  }
+  if (OB_FAIL(ret)) {
+    ready = false;
+    row_count = 0;
+    dim = 0;
+    binding = ObVectorIndexSchemaBinding();
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::prepare_cuvs_batch_index(
+    const ObVectorIndexSchemaIdentity &identity,
+    const ObVectorIndexSchemaBinding &expected_binding,
+    const float *base,
+    const int64_t *ids,
+    int64_t row_count,
+    int64_t dim,
+    bool &prepared)
+{
+  int ret = OB_SUCCESS;
+  prepared = false;
+  ObPluginVectorIndexAdapterGuard guard;
+  ObVectorIndexSchemaBinding current_binding;
+  ObPluginVectorIndexAdaptor *adapter = nullptr;
+  if (!identity.is_valid() || !expected_binding.is_valid()
+      || OB_ISNULL(base) || OB_ISNULL(ids) || row_count <= 0 || dim <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(acquire_adapter_guard(identity, guard, &current_binding))) {
+    LOG_WARN("failed to acquire cuVS batch owner for prepare", K(ret), K(identity));
+  } else if (!(current_binding == expected_binding)
+             || OB_ISNULL(adapter = guard.get_adatper())
+             || !guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(adapter->prepare_cuvs_batch_index(
+                 expected_binding.generation_, expected_binding.data_epoch_,
+                 base, ids, row_count, dim, prepared))) {
+    LOG_WARN("failed to prepare cuVS batch index", K(ret), K(identity), K(expected_binding));
+  } else if (!guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(validate_cuvs_batch_binding_(identity, expected_binding))) {
+  }
+  if (OB_FAIL(ret)) {
+    prepared = false;
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::search_cuvs_batch_index(
+    const ObVectorIndexSchemaIdentity &identity,
+    const ObVectorIndexSchemaBinding &expected_binding,
+    const float *queries,
+    int64_t query_count,
+    int64_t dim,
+    int64_t topk,
+    int64_t *out_ids,
+    float *out_distances,
+    bool &served)
+{
+  int ret = OB_SUCCESS;
+  served = false;
+  ObPluginVectorIndexAdapterGuard guard;
+  ObVectorIndexSchemaBinding current_binding;
+  ObPluginVectorIndexAdaptor *adapter = nullptr;
+  if (!identity.is_valid() || !expected_binding.is_valid()
+      || OB_ISNULL(queries) || query_count <= 0 || dim <= 0 || topk <= 0
+      || OB_ISNULL(out_ids) || OB_ISNULL(out_distances)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(acquire_adapter_guard(identity, guard, &current_binding))) {
+    LOG_WARN("failed to acquire cuVS batch owner for search", K(ret), K(identity));
+  } else if (!(current_binding == expected_binding)
+             || OB_ISNULL(adapter = guard.get_adatper())
+             || !guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(adapter->search_cuvs_batch_index(
+                 expected_binding.generation_, expected_binding.data_epoch_,
+                 queries, query_count, dim, topk, out_ids, out_distances, served))) {
+    LOG_WARN("failed to search cuVS batch index", K(ret), K(identity), K(expected_binding));
+  } else if (!guard.generation_matches() || !guard.data_epoch_matches()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(validate_cuvs_batch_binding_(identity, expected_binding))) {
+  }
+  if (OB_FAIL(ret)) {
+    served = false;
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexService::acquire_ivf_build_helper_guard(
     const ObIvfHelperKey &key,
     ObIndexType type,
@@ -1375,6 +1522,8 @@ int ObPluginVectorIndexMgr::replace_old_adapter(ObPluginVectorIndexAdaptor *new_
                OB_FAIL(new_adapter->inherit_index_id_watermarks_from(*old_adapter))) {
       LOG_WARN("failed to inherit adapter index id watermarks before replace",
                K(ret), KPC(old_adapter), KPC(new_adapter));
+    } else if (OB_NOT_NULL(old_adapter) && old_adapter != new_adapter) {
+      old_adapter->advance_data_epoch();
     }
     // should not fail in following process
     if (OB_FAIL(ret)) {

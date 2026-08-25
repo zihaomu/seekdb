@@ -4317,6 +4317,9 @@ int ObPluginVectorIndexAdaptor::deserialize_snap_data(ObVectorQueryConditions *q
     } else if (OB_FAIL(ObPluginVectorIndexUtils::get_split_snapshot_prefix(index_type, key_prefix, target_prefix))) {
     } else if (OB_FAIL(set_snapshot_key_prefix(target_prefix))) {
     }
+    if (OB_SUCC(ret)) {
+      ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
+    }
   }
   return ret;
 }
@@ -4805,6 +4808,235 @@ int ObPluginVectorIndexAdaptor::get_snap_index_row_cnt(int64_t &count)
   if (OB_NOT_NULL(get_snap_index()) && OB_FAIL(obvectorutil::get_index_number(get_snap_index(), count))) {
     LOG_WARN("failed to get snap index number.", K(ret));
   } else {
+  }
+  return ret;
+}
+
+static bool validate_cuvs_batch_token(void *ctx, uint64_t generation, uint64_t epoch)
+{
+  ObPluginVectorIndexAdaptor *adapter = static_cast<ObPluginVectorIndexAdaptor *>(ctx);
+  bool valid = OB_NOT_NULL(adapter)
+      && adapter->get_generation() == generation
+      && adapter->get_data_epoch() == epoch;
+  if (valid) {
+    schema::ObSchemaGetterGuard schema_guard;
+    const schema::ObTableSchema *data_schema = nullptr;
+    const schema::ObTableSchema *inc_schema = nullptr;
+    ObSEArray<uint64_t, 2> vector_column_ids;
+    ObVectorIndexSchemaIdentity identity;
+    int ret = schema::ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(
+        schema_guard);
+    if (OB_SUCC(ret)) {
+      ret = schema_guard.get_table_schema(adapter->get_data_table_id(), data_schema);
+    }
+    if (OB_SUCC(ret)) {
+      ret = schema_guard.get_table_schema(adapter->get_inc_table_id(), inc_schema);
+    }
+    if (OB_SUCC(ret) && (OB_ISNULL(data_schema) || OB_ISNULL(inc_schema))) {
+      ret = OB_TABLE_NOT_EXIST;
+    }
+    if (OB_SUCC(ret)) {
+      ret = ObVectorIndexUtil::get_vector_index_column_id(
+          *data_schema, *inc_schema, vector_column_ids);
+    }
+    if (OB_SUCC(ret) && vector_column_ids.count() != 1) {
+      ret = OB_STATE_NOT_MATCH;
+    }
+    if (OB_SUCC(ret)) {
+      ret = ObVectorIndexUtil::resolve_hnsw_schema_identity(
+          schema_guard, *data_schema, vector_column_ids.at(0), identity);
+    }
+    valid = OB_SUCCESS == ret
+        && identity.data_table_id_ == adapter->get_data_table_id()
+        && identity.inc_table_id_ == adapter->get_inc_table_id()
+        && identity.vbitmap_table_id_ == adapter->get_vbitmap_table_id()
+        && identity.snapshot_table_id_ == adapter->get_snapshot_table_id()
+        && adapter->get_data_epoch() == epoch;
+  }
+  return valid;
+}
+
+bool ObPluginVectorIndexAdaptor::is_cuvs_batch_supported_()
+{
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+  return is_complete()
+      && OB_NOT_NULL(param)
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH);
+}
+
+int ObPluginVectorIndexAdaptor::check_cuvs_batch_index(
+    uint64_t expected_generation,
+    uint64_t expected_epoch,
+    bool &ready,
+    int64_t &row_count,
+    int64_t &dim)
+{
+  int ret = OB_SUCCESS;
+  ready = false;
+  row_count = 0;
+  dim = 0;
+  int64_t incr_count = 0;
+  int64_t snap_count = 0;
+  if (expected_generation == 0 || expected_epoch == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid cuVS batch epoch", K(ret), K(expected_epoch));
+  } else if (expected_generation != get_generation() || expected_epoch != get_data_epoch()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (!is_cuvs_batch_supported_()
+             || !is_mem_data_init_atomic(VIRT_SNAP)) {
+  } else {
+    if (is_mem_data_init_atomic(VIRT_INC)) {
+      TCRLockGuard lock_guard(incr_data_->mem_data_rwlock_);
+      if (OB_FAIL(get_inc_index_row_cnt(incr_count))) {
+        LOG_WARN("failed to get incremental index count", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && incr_count == 0) {
+      TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+      void *key = get_snap_index();
+      long cached_count = 0;
+      long cached_dim = 0;
+      if (OB_FAIL(get_snap_index_row_cnt(snap_count))) {
+        LOG_WARN("failed to get snapshot index count", K(ret));
+      } else if (OB_FAIL(get_dim(dim))) {
+        LOG_WARN("failed to get vector dimension", K(ret));
+      } else if (OB_NOT_NULL(key) && snap_count > 0
+                 && common::obvsag::cuvs_batch_index_ready(
+                     key, expected_generation, expected_epoch,
+                     GCONF.vector_cagra_cache_ttl, cached_count, cached_dim)) {
+        ready = cached_count == snap_count && cached_dim == dim;
+        if (ready) {
+          row_count = snap_count;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && (expected_generation != get_generation()
+                       || expected_epoch != get_data_epoch())) {
+    ready = false;
+    row_count = 0;
+    dim = 0;
+    ret = OB_STATE_NOT_MATCH;
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::prepare_cuvs_batch_index(
+    uint64_t expected_generation,
+    uint64_t expected_epoch,
+    const float *base,
+    const int64_t *ids,
+    int64_t row_count,
+    int64_t dim,
+    bool &prepared)
+{
+  int ret = OB_SUCCESS;
+  prepared = false;
+  int64_t incr_count = 0;
+  int64_t snap_count = 0;
+  int64_t index_dim = 0;
+  if (expected_generation == 0 || expected_epoch == 0 || OB_ISNULL(base) || OB_ISNULL(ids)
+      || row_count <= 0 || dim <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid cuVS batch prepare argument", K(ret), K(expected_epoch),
+             KP(base), KP(ids), K(row_count), K(dim));
+  } else if (expected_generation != get_generation() || expected_epoch != get_data_epoch()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (!is_cuvs_batch_supported_()
+             || !is_mem_data_init_atomic(VIRT_SNAP)) {
+  } else {
+    if (is_mem_data_init_atomic(VIRT_INC)) {
+      TCRLockGuard lock_guard(incr_data_->mem_data_rwlock_);
+      if (OB_FAIL(get_inc_index_row_cnt(incr_count))) {
+        LOG_WARN("failed to get incremental index count", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && incr_count == 0) {
+      TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+      void *key = get_snap_index();
+      if (OB_FAIL(get_snap_index_row_cnt(snap_count))) {
+        LOG_WARN("failed to get snapshot index count", K(ret));
+      } else if (OB_FAIL(get_dim(index_dim))) {
+        LOG_WARN("failed to get vector dimension", K(ret));
+      } else if (OB_NOT_NULL(key) && snap_count == row_count && index_dim == dim) {
+        ob_mark_cuvs_if_needed(algo_data_, key);
+        const int64_t vector_memory_limit = GMEMCONF.get_vector_memory_limit();
+        const uint64_t host_memory_used = get_all_vsag_mem_used();
+        const size_t batch_budget = vector_memory_limit > 0
+            && static_cast<uint64_t>(vector_memory_limit) > host_memory_used
+            ? static_cast<size_t>(static_cast<uint64_t>(vector_memory_limit) - host_memory_used)
+            : 0;
+        prepared = common::obvsag::cuvs_prepare_batch_index(
+            key, expected_generation, expected_epoch, base, ids, row_count, dim,
+            batch_budget, validate_cuvs_batch_token, this);
+      }
+    }
+  }
+  if (OB_SUCC(ret) && (expected_generation != get_generation()
+                       || expected_epoch != get_data_epoch())) {
+    prepared = false;
+    ret = OB_STATE_NOT_MATCH;
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::search_cuvs_batch_index(
+    uint64_t expected_generation,
+    uint64_t expected_epoch,
+    const float *queries,
+    int64_t query_count,
+    int64_t dim,
+    int64_t topk,
+    int64_t *out_ids,
+    float *out_distances,
+    bool &served)
+{
+  int ret = OB_SUCCESS;
+  served = false;
+  int64_t incr_count = 0;
+  int64_t snap_count = 0;
+  if (expected_generation == 0 || expected_epoch == 0 || OB_ISNULL(queries) || OB_ISNULL(out_ids)
+      || OB_ISNULL(out_distances) || query_count <= 0 || dim <= 0 || topk <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid cuVS batch search argument", K(ret), K(expected_epoch),
+             KP(queries), K(query_count), K(topk), KP(out_ids), KP(out_distances));
+  } else if (expected_generation != get_generation() || expected_epoch != get_data_epoch()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (!is_cuvs_batch_supported_()
+             || !is_mem_data_init_atomic(VIRT_SNAP)) {
+  } else {
+    if (is_mem_data_init_atomic(VIRT_INC)) {
+      TCRLockGuard lock_guard(incr_data_->mem_data_rwlock_);
+      if (OB_FAIL(get_inc_index_row_cnt(incr_count))) {
+        LOG_WARN("failed to get incremental index count", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && incr_count == 0) {
+      TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+      void *key = get_snap_index();
+      long cached_count = 0;
+      long cached_dim = 0;
+      if (OB_FAIL(get_snap_index_row_cnt(snap_count))) {
+        LOG_WARN("failed to get snapshot index count", K(ret));
+      } else if (OB_NOT_NULL(key) && snap_count > 0) {
+        if (common::obvsag::cuvs_batch_index_ready(
+                key, expected_generation, expected_epoch,
+                GCONF.vector_cagra_cache_ttl, cached_count, cached_dim)
+            && cached_count == snap_count && cached_dim == dim) {
+          served = common::obvsag::cuvs_knn_search_batch(
+              key, expected_generation, expected_epoch, queries, query_count, dim, topk,
+              out_ids, out_distances) == query_count;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && (expected_generation != get_generation()
+                       || expected_epoch != get_data_epoch())) {
+    served = false;
+    ret = OB_STATE_NOT_MATCH;
   }
   return ret;
 }

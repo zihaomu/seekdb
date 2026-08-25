@@ -96,6 +96,10 @@ DEF_PARAM(vector_memory_limit, CAP, OB_CLUSTER_PARAMETER, "0M", "[0M,)",
         "The automatic value is 50% of memory_budget. "
         "Range: [0M,).",
         ObParameterAttr(Section::RUNTIME, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_PARAM(vector_cagra_cache_ttl, TIME, OB_CLUSTER_PARAMETER, "0s", "[0s,)",
+         "the maximum lifetime of persistent CAGRA batch cache entries. 0 disables TTL eviction. "
+         "Expired entries are lazily evicted before reuse. Range: [0s,).",
+         ObParameterAttr(Section::RUNTIME, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_PARAM(cpu_count, INT, OB_CLUSTER_PARAMETER, "0", "[0,]",
         "the number of CPU\\'s in the system. "
         "If this parameter is set to zero, the number will be set according to sysconf; "

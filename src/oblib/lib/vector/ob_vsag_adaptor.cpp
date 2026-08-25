@@ -20,10 +20,13 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <pthread.h>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
@@ -34,6 +37,7 @@
 #include "vsag/factory.h"
 #include "lib/utility/ob_print_utils.h"
 #include "lib/oblog/ob_log.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/worker.h"
 
 // [hipVS/cuVS] GPU vector-search bridge symbol, implemented in
@@ -46,6 +50,8 @@ extern "C" void *seekdb_cuvs_build(const float *base, long n, long dim);
 extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, long topk,
                                     unsigned int *out_ids, float *out_dist);
 extern "C" void  seekdb_cuvs_free(void *handle);
+extern "C" size_t seekdb_cuvs_estimated_bytes(void *handle);
+extern "C" size_t seekdb_cuvs_estimate_build_bytes(long n, long dim);
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -53,6 +59,8 @@ extern "C" void  seekdb_cuvs_free(void *handle);
 static int   seekdb_cuvs_cagra_knn(const float *, long, long, const float *, long, long, unsigned int *) { return -1; }
 static void *seekdb_cuvs_build(const float *, long, long) { return nullptr; }
 static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int *, float *) { return -1; }
+static size_t seekdb_cuvs_estimated_bytes(void *) { return 0; }
+static size_t seekdb_cuvs_estimate_build_bytes(long, long) { return 0; }
 static void  seekdb_cuvs_free(void *) {}
 #endif
 
@@ -68,16 +76,43 @@ using namespace vsag;
 // runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
 // index, results allocated with the handle's allocator (drop-in with VSAG path).
 namespace {
+enum class ObCuvsBatchState : uint8_t {
+  EMPTY = 0,
+  BUILDING,
+  READY,
+  FAILED,
+};
+
 struct ObCuvsEntry {
+  uint64_t instance_id_ = 0;
   void *bridge_ = nullptr;      // opaque handle from seekdb_cuvs_build
+  void *batch_bridge_ = nullptr;
   int dim_ = 0;
+  int batch_dim_ = 0;
   std::vector<int64_t> ids_;    // CAGRA row offset -> external vid (of the built index)
+  std::vector<int64_t> batch_ids_;
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+  uint64_t batch_built_generation_ = 0;
+  uint64_t batch_built_epoch_ = 0;
+  ObCuvsBatchState batch_state_ = ObCuvsBatchState::EMPTY;
+  uint64_t batch_build_generation_ = 0;
+  uint64_t batch_build_epoch_ = 0;
+  uint64_t batch_build_attempt_ = 0;
+  uint64_t batch_failed_attempt_ = 0;
+  size_t batch_estimated_bytes_ = 0;
+  size_t batch_reserved_bytes_ = 0;
+  uint64_t batch_reserved_attempt_ = 0;
+  int64_t batch_last_access_us_ = 0;
+  int64_t batch_built_at_us_ = 0;
 };
 static std::mutex g_ob_cuvs_mu;
+static std::condition_variable g_ob_cuvs_cv;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
+static uint64_t g_ob_cuvs_entry_instance = 0;
+static size_t g_ob_cuvs_batch_resident_bytes = 0;
+static size_t g_ob_cuvs_batch_reserved_bytes = 0;
 static std::mutex g_ob_cuvs_marked_mu;
 static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
 // GPU backend available? (used by the explicit dbms_vector.batch_knn path)
@@ -117,6 +152,103 @@ static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) 
   (void)fn; (void)h; (void)a; (void)b;
 #endif
 }
+static void trace_cuvs_batch_accounting(const char *event, void *key)
+{
+  ob_vsag_trace(event, key,
+                static_cast<long>(g_ob_cuvs_batch_resident_bytes),
+                static_cast<long>(g_ob_cuvs_batch_reserved_bytes));
+}
+
+static void reserve_cuvs_batch_bytes(ObCuvsEntry &entry, uint64_t attempt,
+                                     size_t estimated_bytes, void *key)
+{
+  entry.batch_reserved_bytes_ = estimated_bytes;
+  entry.batch_reserved_attempt_ = attempt;
+  g_ob_cuvs_batch_reserved_bytes += estimated_bytes;
+  trace_cuvs_batch_accounting("cuvs_mem_resv", key);
+}
+
+static void release_cuvs_batch_reservation(ObCuvsEntry *entry, uint64_t attempt,
+                                           size_t reserved_bytes, void *key)
+{
+  if (reserved_bytes > g_ob_cuvs_batch_reserved_bytes) {
+    g_ob_cuvs_batch_reserved_bytes = 0;
+    ob_vsag_trace("cuvs_mem_under", key, 0, static_cast<long>(reserved_bytes));
+  } else {
+    g_ob_cuvs_batch_reserved_bytes -= reserved_bytes;
+  }
+  if (entry != nullptr && entry->batch_reserved_attempt_ == attempt) {
+    entry->batch_reserved_bytes_ = 0;
+    entry->batch_reserved_attempt_ = 0;
+  }
+  trace_cuvs_batch_accounting("cuvs_mem_rel", key);
+}
+
+static void retire_cuvs_batch_bytes(ObCuvsEntry &entry, void *key)
+{
+  const size_t resident_bytes = entry.batch_estimated_bytes_;
+  if (resident_bytes > 0) {
+    if (resident_bytes > g_ob_cuvs_batch_resident_bytes) {
+      g_ob_cuvs_batch_resident_bytes = 0;
+      ob_vsag_trace("cuvs_mem_under", key, static_cast<long>(resident_bytes), 0);
+    } else {
+      g_ob_cuvs_batch_resident_bytes -= resident_bytes;
+    }
+    trace_cuvs_batch_accounting("cuvs_mem_retire", key);
+  }
+  entry.batch_estimated_bytes_ = 0;
+  entry.batch_last_access_us_ = 0;
+  entry.batch_built_at_us_ = 0;
+}
+static bool exceeds_cuvs_batch_budget(size_t estimated_bytes, size_t budget_bytes)
+{
+  if (estimated_bytes == 0 || budget_bytes == 0
+      || g_ob_cuvs_batch_resident_bytes > budget_bytes) {
+    return true;
+  }
+  const size_t after_resident = budget_bytes - g_ob_cuvs_batch_resident_bytes;
+  return g_ob_cuvs_batch_reserved_bytes > after_resident
+      || estimated_bytes > after_resident - g_ob_cuvs_batch_reserved_bytes;
+}
+
+static bool detach_lru_cuvs_batch(void *exclude_key, void *&bridge, void *&victim_key)
+{
+  ObCuvsEntry *victim = nullptr;
+  for (auto &item : g_ob_cuvs_reg) {
+    ObCuvsEntry *entry = item.second;
+    if (item.first != exclude_key && entry != nullptr
+        && entry->batch_state_ == ObCuvsBatchState::READY
+        && entry->batch_bridge_ != nullptr && entry->batch_estimated_bytes_ > 0
+        && (victim == nullptr
+            || entry->batch_last_access_us_ < victim->batch_last_access_us_)) {
+      victim = entry;
+      victim_key = item.first;
+    }
+  }
+  if (victim == nullptr) {
+    return false;
+  }
+  bridge = victim->batch_bridge_;
+  const size_t estimated_bytes = victim->batch_estimated_bytes_;
+  const int64_t last_access_us = victim->batch_last_access_us_;
+  victim->batch_bridge_ = nullptr;
+  victim->batch_dim_ = 0;
+  victim->batch_ids_.clear();
+  victim->batch_built_generation_ = 0;
+  victim->batch_built_epoch_ = 0;
+  victim->batch_build_generation_ = 0;
+  victim->batch_build_epoch_ = 0;
+  victim->batch_failed_attempt_ = 0;
+  victim->batch_state_ = ObCuvsBatchState::EMPTY;
+  ob_vsag_trace("cuvs_lru_evict", victim_key,
+                static_cast<long>(estimated_bytes),
+                static_cast<long>(last_access_us));
+  retire_cuvs_batch_bytes(*victim, victim_key);
+  g_ob_cuvs_cv.notify_all();
+  return true;
+}
+
+
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
   void *bridge = seekdb_cuvs_build(vectors, size, dim);
@@ -124,9 +256,16 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
   ObCuvsEntry *ent = new ObCuvsEntry();
   ent->bridge_ = bridge; ent->dim_ = dim; ent->ids_.assign(ids, ids + size);
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  ent->instance_id_ = ++g_ob_cuvs_entry_instance;
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-  if (slot != nullptr) { seekdb_cuvs_free(slot->bridge_); delete slot; }
+  if (slot != nullptr) {
+    retire_cuvs_batch_bytes(*slot, key);
+    if (slot->bridge_ != nullptr) { seekdb_cuvs_free(slot->bridge_); }
+    if (slot->batch_bridge_ != nullptr) { seekdb_cuvs_free(slot->batch_bridge_); }
+    delete slot;
+  }
   slot = ent;
+  g_ob_cuvs_cv.notify_all();
 }
 // Buffer vectors arriving via add_index. Plain HNSW builds BOTH its delta and its
 // snapshot incrementally via add_index (one row at a time), so this is where the
@@ -136,7 +275,11 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-  if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
+  if (slot == nullptr) {
+    slot = new ObCuvsEntry();
+    slot->instance_id_ = ++g_ob_cuvs_entry_instance;
+    slot->dim_ = dim;
+  }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
   if (slot->dim_ != dim) { return; }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
@@ -148,9 +291,14 @@ static void ob_cuvs_erase(void *key) {
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it != g_ob_cuvs_reg.end()) {
+    retire_cuvs_batch_bytes(*it->second, key);
     if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); }
+    if (it->second->batch_bridge_) {
+      seekdb_cuvs_free(it->second->batch_bridge_);
+    }
     delete it->second; g_ob_cuvs_reg.erase(it);
   }
+  g_ob_cuvs_cv.notify_all();
 }
 struct ObCuvsJob {
   ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
@@ -184,24 +332,44 @@ static void *ob_cuvs_job(void *arg) {
 // [BATCH] Feed nq probe vectors to ONE cuVS call (nq>1). Same large-stack
 // pthread pattern as the single-query path (cuVS overflows the OB worker stack).
 struct ObCuvsBatchJob {
-  ObCuvsEntry *ent; const float *queries; long nq; long topk; size_t n;
-  bool need_build; unsigned *off; float *dst; long served_; bool built_;
+  void *bridge; const float *queries; long nq; long topk;
+  unsigned *off; float *dst; long served_;
 };
 static void *ob_cuvs_batch_job(void *arg) {
   ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
-  if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
-                                 static_cast<long>(j->ent->dim_));
-    if (nb != nullptr) {
-      if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
-      j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
-      j->built_ = true;
-    }
-  }
-  if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    if (seekdb_cuvs_search(j->ent->bridge_, j->queries, j->nq, j->topk,
+  if (j->bridge != nullptr) {
+    if (seekdb_cuvs_search(j->bridge, j->queries, j->nq, j->topk,
                            j->off, j->dst) == 0) { j->served_ = j->nq; }
   }
+  return nullptr;
+}
+
+struct ObCuvsPrepareJob {
+  const float *base; long n; long dim; void *bridge_;
+};
+static void *ob_cuvs_prepare_job(void *arg) {
+  ObCuvsPrepareJob *j = static_cast<ObCuvsPrepareJob *>(arg);
+#ifdef OB_BUILD_CUVS_TRACE
+  const char *build_delay_ms = ::getenv("OB_CUVS_BATCH_BUILD_DELAY_MS");
+  if (build_delay_ms != nullptr) {
+    const long delay = ::strtol(build_delay_ms, nullptr, 10);
+    if (delay > 0 && delay <= 10000) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+  }
+  const char *fail_batch_build = ::getenv("OB_CUVS_FAIL_BATCH_BUILD");
+  if (fail_batch_build != nullptr && fail_batch_build[0] == '1') {
+    const char *delay_ms = ::getenv("OB_CUVS_FAIL_BATCH_BUILD_DELAY_MS");
+    if (delay_ms != nullptr) {
+      const long delay = ::strtol(delay_ms, nullptr, 10);
+      if (delay > 0 && delay <= 10000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+      }
+    }
+    return nullptr;
+  }
+#endif
+  j->bridge_ = seekdb_cuvs_build(j->base, j->n, j->dim);
   return nullptr;
 }
 
@@ -1733,42 +1901,342 @@ int cuvs_cagra_knn(const float *base, long n, long dim,
   return ::seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids);
 }
 
+static int compare_cuvs_batch_token(uint64_t lhs_generation, uint64_t lhs_epoch,
+                                    uint64_t rhs_generation, uint64_t rhs_epoch)
+{
+  int result = 0;
+  if (lhs_generation < rhs_generation) { result = -1; }
+  else if (lhs_generation > rhs_generation) { result = 1; }
+  else if (lhs_epoch < rhs_epoch) { result = -1; }
+  else if (lhs_epoch > rhs_epoch) { result = 1; }
+  return result;
+}
+
+bool cuvs_prepare_batch_index(void *key, uint64_t current_generation,
+                              uint64_t current_epoch,
+                              const float *base, const int64_t *ids,
+                              long n, long dim,
+                              size_t budget_bytes,
+                              CuvsBatchTokenValidator token_validator,
+                              void *token_ctx)
+{
+  if (!ob_cuvs_enabled() || !ob_cuvs_marked(key) || current_generation == 0
+      || current_epoch == 0 || base == nullptr || ids == nullptr
+      || n < static_cast<long>(OB_CUVS_MIN_PTS) || dim <= 0
+      || token_validator == nullptr) {
+    return false;
+  }
+
+  uint64_t entry_instance = 0;
+  uint64_t build_attempt = 0;
+  uint64_t waited_attempt = 0;
+  size_t reserved_bytes = 0;
+  const size_t estimated_bytes = seekdb_cuvs_estimate_build_bytes(n, dim);
+#ifdef OB_BUILD_CUVS_TRACE
+  const char *budget_override = ::getenv("OB_CUVS_BATCH_BUDGET_BYTES");
+  if (budget_override != nullptr) {
+    budget_bytes = static_cast<size_t>(::strtoull(budget_override, nullptr, 10));
+  }
+#endif
+  {
+    std::unique_lock<std::mutex> guard(g_ob_cuvs_mu);
+    while (true) {
+      auto it = g_ob_cuvs_reg.find(key);
+      if (it == g_ob_cuvs_reg.end()) {
+        return false;
+      }
+      ObCuvsEntry *ent = it->second;
+      entry_instance = ent->instance_id_;
+      const int built_cmp = compare_cuvs_batch_token(
+          ent->batch_built_generation_, ent->batch_built_epoch_,
+          current_generation, current_epoch);
+      if (ent->batch_state_ == ObCuvsBatchState::READY && built_cmp == 0
+          && ent->batch_bridge_ != nullptr && ent->batch_dim_ == dim
+          && ent->batch_ids_.size() == static_cast<size_t>(n)) {
+        return true;
+      }
+
+      const int build_cmp = compare_cuvs_batch_token(
+          ent->batch_build_generation_, ent->batch_build_epoch_,
+          current_generation, current_epoch);
+      if (ent->batch_state_ == ObCuvsBatchState::BUILDING && build_cmp == 0) {
+        waited_attempt = ent->batch_build_attempt_;
+        ob_vsag_trace("cuvs_batch_wait", key, current_generation, current_epoch);
+        const bool changed = g_ob_cuvs_cv.wait_for(
+            guard, std::chrono::seconds(300), [key, entry_instance, current_generation, current_epoch]() {
+              auto current = g_ob_cuvs_reg.find(key);
+              return current == g_ob_cuvs_reg.end()
+                  || current->second->instance_id_ != entry_instance
+                  || current->second->batch_state_ != ObCuvsBatchState::BUILDING
+                  || current->second->batch_build_generation_ != current_generation
+                  || current->second->batch_build_epoch_ != current_epoch;
+            });
+        if (!changed) {
+          ob_vsag_trace("cuvs_batch_timeout", key, current_generation, current_epoch);
+          return false;
+        }
+        continue;
+      } else if (ent->batch_state_ == ObCuvsBatchState::BUILDING && build_cmp > 0) {
+        return false;
+      } else if (ent->batch_state_ == ObCuvsBatchState::FAILED && build_cmp >= 0) {
+        return false;
+      } else if (ent->batch_state_ == ObCuvsBatchState::READY && built_cmp > 0) {
+        return false;
+      } else if (exceeds_cuvs_batch_budget(estimated_bytes, budget_bytes)) {
+        void *evicted_bridge = nullptr;
+        void *victim_key = nullptr;
+        if (detach_lru_cuvs_batch(key, evicted_bridge, victim_key)) {
+          guard.unlock();
+          seekdb_cuvs_free(evicted_bridge);
+          ob_vsag_trace("cuvs_lru_free", victim_key, 0, 0);
+          guard.lock();
+          continue;
+        } else {
+          ob_vsag_trace("cuvs_mem_deny", key,
+                        static_cast<long>(g_ob_cuvs_batch_resident_bytes
+                            + g_ob_cuvs_batch_reserved_bytes),
+                        static_cast<long>(budget_bytes));
+          return false;
+        }
+      } else {
+        ent->batch_state_ = ObCuvsBatchState::BUILDING;
+        ent->batch_build_generation_ = current_generation;
+        ent->batch_build_epoch_ = current_epoch;
+        ++ent->batch_build_attempt_;
+        build_attempt = ent->batch_build_attempt_;
+        reserved_bytes = estimated_bytes;
+        reserve_cuvs_batch_bytes(*ent, build_attempt, reserved_bytes, key);
+        g_ob_cuvs_cv.notify_all();
+        break;
+      }
+    }
+  }
+
+  ob_vsag_trace("cuvs_batch_begin", key, dim, n);
+  ObCuvsPrepareJob job{base, n, dim, nullptr};
+  pthread_t tid;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (pthread_create(&tid, &attr, ob_cuvs_prepare_job, &job) == 0) {
+    pthread_join(tid, nullptr);
+  }
+  pthread_attr_destroy(&attr);
+  ob_vsag_trace("cuvs_batch_end", key, job.bridge_ != nullptr ? 1 : 0, n);
+  if (job.bridge_ == nullptr) {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(key);
+    ObCuvsEntry *entry = nullptr;
+    if (it != g_ob_cuvs_reg.end() && it->second->instance_id_ == entry_instance) {
+      entry = it->second;
+      if (entry->batch_state_ == ObCuvsBatchState::BUILDING
+          && entry->batch_build_generation_ == current_generation
+          && entry->batch_build_epoch_ == current_epoch) {
+        entry->batch_state_ = ObCuvsBatchState::FAILED;
+        entry->batch_failed_attempt_ = entry->batch_build_attempt_;
+      }
+    }
+    release_cuvs_batch_reservation(entry, build_attempt, reserved_bytes, key);
+    g_ob_cuvs_cv.notify_all();
+    return false;
+  }
+
+  size_t built_estimated_bytes = seekdb_cuvs_estimated_bytes(job.bridge_);
+  if (built_estimated_bytes == 0) {
+    built_estimated_bytes = reserved_bytes;
+    ob_vsag_trace("cuvs_mem_unknown", key, dim, n);
+  }
+
+  void *old_bridge = nullptr;
+  bool published = false;
+  bool stale = false;
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(key);
+    if (it != g_ob_cuvs_reg.end()) {
+      ObCuvsEntry *ent = it->second;
+      if (ent->instance_id_ == entry_instance
+          && ent->batch_state_ == ObCuvsBatchState::BUILDING
+          && ent->batch_build_generation_ == current_generation
+          && ent->batch_build_epoch_ == current_epoch
+          && !token_validator(token_ctx, current_generation, current_epoch)) {
+        ent->batch_state_ = ObCuvsBatchState::FAILED;
+        ent->batch_failed_attempt_ = ent->batch_build_attempt_;
+        stale = true;
+      } else if (ent->instance_id_ == entry_instance
+          && ent->batch_state_ == ObCuvsBatchState::BUILDING
+          && ent->batch_build_generation_ == current_generation
+          && ent->batch_build_epoch_ == current_epoch) {
+        release_cuvs_batch_reservation(ent, build_attempt, reserved_bytes, key);
+        reserved_bytes = 0;
+        old_bridge = ent->batch_bridge_;
+        retire_cuvs_batch_bytes(*ent, key);
+        ent->batch_bridge_ = job.bridge_;
+        ent->batch_dim_ = static_cast<int>(dim);
+        ent->batch_ids_.assign(ids, ids + n);
+        ent->batch_built_generation_ = current_generation;
+        ent->batch_built_epoch_ = current_epoch;
+        ent->batch_estimated_bytes_ = built_estimated_bytes;
+        ent->batch_built_at_us_ = ObTimeUtility::current_time();
+        ent->batch_last_access_us_ = ent->batch_built_at_us_;
+        g_ob_cuvs_batch_resident_bytes += built_estimated_bytes;
+        ent->batch_state_ = ObCuvsBatchState::READY;
+        job.bridge_ = nullptr;
+        published = true;
+        trace_cuvs_batch_accounting("cuvs_mem_commit", key);
+        ob_vsag_trace("cuvs_lru_ready", key,
+                      static_cast<long>(ent->batch_estimated_bytes_),
+                      static_cast<long>(ent->batch_last_access_us_));
+      }
+    }
+    if (reserved_bytes > 0) {
+      ObCuvsEntry *reservation_entry = it != g_ob_cuvs_reg.end()
+          && it->second->instance_id_ == entry_instance ? it->second : nullptr;
+      release_cuvs_batch_reservation(
+          reservation_entry, build_attempt, reserved_bytes, key);
+    }
+    g_ob_cuvs_cv.notify_all();
+  }
+  if (old_bridge != nullptr) {
+    seekdb_cuvs_free(old_bridge);
+  }
+  if (job.bridge_ != nullptr) {
+    seekdb_cuvs_free(job.bridge_);
+  }
+  if (stale) {
+    ob_vsag_trace("cuvs_batch_stale", key, current_generation, current_epoch);
+  }
+  if (published) {
+    ob_vsag_trace("cuvs_batch_build", key, dim, n);
+  }
+  return published;
+}
+
+bool cuvs_batch_index_ready(void *key, uint64_t current_generation,
+                            uint64_t current_epoch,
+                            int64_t ttl_us,
+                            long &n, long &dim)
+{
+  n = 0;
+  dim = 0;
+  if (key == nullptr || current_generation == 0 || current_epoch == 0) {
+    return false;
+  }
+#ifdef OB_BUILD_CUVS_TRACE
+  const char *ttl_override = ::getenv("OB_CUVS_BATCH_TTL_US");
+  if (ttl_override != nullptr) {
+    ttl_us = static_cast<int64_t>(::strtoll(ttl_override, nullptr, 10));
+  }
+#endif
+  void *expired_bridge = nullptr;
+  bool ready = false;
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(key);
+    if (it != g_ob_cuvs_reg.end()) {
+      ObCuvsEntry *ent = it->second;
+      const int64_t now_us = ObTimeUtility::current_time();
+      const bool expired = ttl_us > 0
+          && ent->batch_state_ == ObCuvsBatchState::READY
+          && ent->batch_bridge_ != nullptr
+          && ent->batch_built_at_us_ > 0
+          && now_us >= ent->batch_built_at_us_
+          && now_us - ent->batch_built_at_us_ >= ttl_us;
+      if (expired) {
+        expired_bridge = ent->batch_bridge_;
+        const size_t estimated_bytes = ent->batch_estimated_bytes_;
+        const int64_t age_us = now_us - ent->batch_built_at_us_;
+        ent->batch_bridge_ = nullptr;
+        ent->batch_dim_ = 0;
+        ent->batch_ids_.clear();
+        ent->batch_built_generation_ = 0;
+        ent->batch_built_epoch_ = 0;
+        ent->batch_build_generation_ = 0;
+        ent->batch_build_epoch_ = 0;
+        ent->batch_failed_attempt_ = 0;
+        ent->batch_state_ = ObCuvsBatchState::EMPTY;
+        ob_vsag_trace("cuvs_ttl_evict", key,
+                      static_cast<long>(estimated_bytes),
+                      static_cast<long>(age_us));
+        retire_cuvs_batch_bytes(*ent, key);
+        g_ob_cuvs_cv.notify_all();
+      } else if (ent->batch_state_ == ObCuvsBatchState::READY
+                 && ent->batch_bridge_ != nullptr
+                 && ent->batch_built_generation_ == current_generation
+                 && ent->batch_built_epoch_ == current_epoch
+                 && !ent->batch_ids_.empty() && ent->batch_dim_ > 0) {
+        n = static_cast<long>(ent->batch_ids_.size());
+        dim = ent->batch_dim_;
+        ready = true;
+      }
+    }
+  }
+  if (expired_bridge != nullptr) {
+    seekdb_cuvs_free(expired_bridge);
+    ob_vsag_trace("cuvs_ttl_free", expired_bridge, 0, 0);
+  }
+  return ready;
+}
+
 // [hipVS/cuVS BATCH operator] Feed nq probe vectors (row-major, dim from the
 // registered index) to ONE GPU call over an add_index-buffered index. Caller
 // allocates out_ids[nq*topk] (original vids) and out_dist[nq*topk]. Returns the
 // number of queries served (nq) or 0 to fall back to CPU. This is the seam a
 // batched vector operator (similarity JOIN / bulk ANN) would call to exploit the
 // ~50-260x GPU batch speedup over per-probe knn_search (single-query gets no win).
-long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
+long cuvs_knn_search_batch(void *key, uint64_t current_generation,
+                           uint64_t current_epoch,
+                           const float *queries, long nq, long dim, long topk,
                            int64_t *out_ids, float *out_dist)
 {
   if (key == nullptr || queries == nullptr || out_ids == nullptr ||
-      out_dist == nullptr || nq <= 0 || topk <= 0) { return 0; }
+      out_dist == nullptr || current_generation == 0 || current_epoch == 0
+      || nq <= 0 || dim <= 0 || topk <= 0) { return 0; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return 0; }
   ObCuvsEntry *ent = it->second;
-  const size_t n = ent->buf_ids_.size();
-  const bool need_build =
-      (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
+  const size_t n = ent->batch_ids_.size();
+  if (ent->batch_bridge_ == nullptr
+      || ent->batch_built_generation_ != current_generation
+      || ent->batch_built_epoch_ != current_epoch
+      || ent->batch_dim_ != dim
+      || n == 0 || topk > static_cast<long>(n)) { return 0; }
+#ifdef OB_BUILD_CUVS_TRACE
+  const char *search_delay_ms = ::getenv("OB_CUVS_BATCH_SEARCH_DELAY_MS");
+  if (search_delay_ms != nullptr) {
+    const long delay = ::strtol(search_delay_ms, nullptr, 10);
+    if (delay > 0 && delay <= 10000) {
+      ob_vsag_trace("cuvs_search_hold", key, delay,
+                    static_cast<long>(ent->batch_last_access_us_));
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+      ob_vsag_trace("cuvs_search_resume", key, delay, 0);
+    }
+  }
+#endif
+
   std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
   std::vector<float> dst(static_cast<size_t>(nq) * topk);
-  ObCuvsBatchJob job{ent, queries, nq, topk, n, need_build,
-                     off.data(), dst.data(), 0, false};
+  ObCuvsBatchJob job{ent->batch_bridge_, queries, nq, topk,
+                     off.data(), dst.data(), 0};
   pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
   if (pthread_create(&tid, &attr, ob_cuvs_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
-  if (job.built_) { ob_vsag_trace("cuvs_batch_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (job.served_ != nq) { return 0; }
   for (long q = 0; q < nq; ++q) {
     for (long i = 0; i < topk; ++i) {
       const size_t p = static_cast<size_t>(q) * topk + i;
       const unsigned o = off[p];
-      out_ids[p] = (o < ent->ids_.size()) ? ent->ids_[o] : -1;
+      out_ids[p] = (o < ent->batch_ids_.size()) ? ent->batch_ids_[o] : -1;
       out_dist[p] = dst[p];
     }
   }
+  ent->batch_last_access_us_ = ObTimeUtility::current_time();
+  ob_vsag_trace("cuvs_lru_touch", key,
+                static_cast<long>(ent->batch_estimated_bytes_),
+                static_cast<long>(ent->batch_last_access_us_));
+  trace_cuvs_batch_accounting("cuvs_mem_touch", key);
   ob_vsag_trace("cuvs_batch", key, nq, topk);
   return nq;
 }
@@ -1797,8 +2265,20 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 void mark_cuvs_index(void *key) {
 #ifdef OB_BUILD_CUVS
   if (key == nullptr) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  g_ob_cuvs_marked.insert(key);
+  uint64_t instance_id = 0;
+  {
+    std::lock_guard<std::mutex> marked_guard(g_ob_cuvs_marked_mu);
+    const bool inserted = g_ob_cuvs_marked.insert(key).second;
+    if (!inserted) { return; }
+    std::lock_guard<std::mutex> registry_guard(g_ob_cuvs_mu);
+    ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+    if (slot == nullptr) {
+      slot = new ObCuvsEntry();
+      slot->instance_id_ = ++g_ob_cuvs_entry_instance;
+    }
+    instance_id = slot->instance_id_;
+  }
+  ob_vsag_trace("cuvs_mark", key, instance_id, 0);
 #else
   (void)key;
 #endif

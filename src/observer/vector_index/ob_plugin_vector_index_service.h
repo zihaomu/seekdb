@@ -405,6 +405,30 @@ public:
   int acquire_adapter_guard(const ObVectorIndexSchemaIdentity &identity,
                             ObPluginVectorIndexAdapterGuard &adapter_guard,
                             ObVectorIndexSchemaBinding *binding = nullptr) override;
+  int validate_cuvs_batch_binding(
+      const ObVectorIndexSchemaIdentity &identity,
+      const ObVectorIndexSchemaBinding &expected_binding) override;
+  int check_cuvs_batch_index(const ObVectorIndexSchemaIdentity &identity,
+                             ObVectorIndexSchemaBinding &binding,
+                             bool &ready,
+                             int64_t &row_count,
+                             int64_t &dim) override;
+  int prepare_cuvs_batch_index(const ObVectorIndexSchemaIdentity &identity,
+                               const ObVectorIndexSchemaBinding &expected_binding,
+                               const float *base,
+                               const int64_t *ids,
+                               int64_t row_count,
+                               int64_t dim,
+                               bool &prepared) override;
+  int search_cuvs_batch_index(const ObVectorIndexSchemaIdentity &identity,
+                              const ObVectorIndexSchemaBinding &expected_binding,
+                              const float *queries,
+                              int64_t query_count,
+                              int64_t dim,
+                              int64_t topk,
+                              int64_t *out_ids,
+                              float *out_distances,
+                              bool &served) override;
   int acquire_ivf_build_helper_guard(const ObIvfHelperKey &key,
                                      ObIndexType type,
                                      ObIvfBuildHelperGuard &helper_guard,
@@ -454,6 +478,9 @@ public:
   TO_STRING_KV(K_(is_inited), K_(has_start),
                K_(is_ls_or_tablet_changed), KP_(schema_service), KP_(ls_service));
 private:
+  int validate_cuvs_batch_binding_(
+      const ObVectorIndexSchemaIdentity &identity,
+      const ObVectorIndexSchemaBinding &expected_binding);
   // for ivf
   int generate_get_aux_info_sql(
       const uint64_t table_id,
